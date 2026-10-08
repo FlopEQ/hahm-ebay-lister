@@ -30,23 +30,8 @@ export function ModelSelector() {
       .then((data: ModelsPayload) => {
         setModels(data);
 
-        const defaultSort =
-          data.sortModels.find((m) => m.isDefault)?.id ?? data.sortModels[0]?.id ?? "";
-        setSortModel(
-          savedSort && data.sortModels.some((m) => m.id === savedSort)
-            ? savedSort
-            : defaultSort
-        );
-
-        const defaultAnalysis =
-          data.analysisModels.find((m) => m.isDefault)?.id ??
-          data.analysisModels[0]?.id ??
-          "";
-        setAnalysisModel(
-          savedAnalysis && data.analysisModels.some((m) => m.id === savedAnalysis)
-            ? savedAnalysis
-            : defaultAnalysis
-        );
+        setSortModel(savedSort ?? "");
+        setAnalysisModel(savedAnalysis ?? "");
       })
       .catch(() => {
         setLoadError(true);
@@ -65,8 +50,10 @@ export function ModelSelector() {
     saveAnalysisModel(id);
   };
 
-  const sortDesc = models?.sortModels.find((m) => m.id === sortModel)?.description;
-  const analysisDesc = models?.analysisModels.find((m) => m.id === analysisModel)?.description;
+  const sortDefault = models?.sortModels.find(m => m.isDefault);
+  const analysisDefault = models?.analysisModels.find(m => m.isDefault);
+  const sortDesc = (sortModel ? models?.sortModels.find(m => m.id === sortModel) : sortDefault)?.description;
+  const analysisDesc = (analysisModel ? models?.analysisModels.find(m => m.id === analysisModel) : analysisDefault)?.description;
 
   return (
     <>
@@ -85,7 +72,7 @@ export function ModelSelector() {
         <div id="model-settings-body" className="model-settings-body">
           {loadError && (
             <p className="note note-error" style={{ margin: 0, gridColumn: "1 / -1" }}>
-              Couldn&rsquo;t load the model list — the app will use its defaults.
+              Couldn&rsquo;t load the model list. Saved model choices still apply.
             </p>
           )}
 
@@ -98,6 +85,8 @@ export function ModelSelector() {
                 onChange={(e) => handleSortChange(e.target.value)}
                 className="model-select"
               >
+                <option value="">Recommended default{sortDefault ? ` — ${sortDefault.displayName}` : ""}</option>
+                {sortModel && !models.sortModels.some(m => m.id === sortModel) && <option value={sortModel}>{sortModel} (saved choice)</option>}
                 {models.sortModels.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.displayName}
@@ -122,6 +111,8 @@ export function ModelSelector() {
                 onChange={(e) => handleAnalysisChange(e.target.value)}
                 className="model-select"
               >
+                <option value="">Recommended default{analysisDefault ? ` — ${analysisDefault.displayName}` : ""}</option>
+                {analysisModel && !models.analysisModels.some(m => m.id === analysisModel) && <option value={analysisModel}>{analysisModel} (saved choice)</option>}
                 {models.analysisModels.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.displayName}

@@ -1,16 +1,15 @@
 // Split a listing's photos into upload batches that stay far under Vercel's
 // 4.5 MB serverless request-body limit.
 //
-// Photos reach eBay via /api/ebay/upload-photos in these batches; the publish
-// request then carries only the returned eBay-hosted URLs, so no request in
-// the posting flow can ever hit the body limit again (the old single-request
-// flow shipped all 12 base64 photos at once and 413-failed on photo-heavy
-// items like chunky knits).
+// New photos carry private asset references; legacy photos carry small base64
+// images. Publishing receives only confirmed eBay-hosted URLs.
 
 export interface UploadImage {
   mediaType: string;
   data: string; // raw base64, no data-url prefix
 }
+
+export type PhotoUpload = UploadImage | { assetId: string; rotation: number };
 
 // ~2.8 MB of base64 (~2.1 MB of image data) per request. Browser-resized
 // photos run ~200–800 KB of base64 each, so batches hold 3–4 photos and even
@@ -19,21 +18,17 @@ export const MAX_BATCH_BASE64_CHARS = 2_800_000;
 // Bound the count too, so many tiny photos don't pile into one slow request.
 export const MAX_BATCH_PHOTOS = 4;
 
-export function chunkImagesForUpload<T extends UploadImage>(
+export function chunkImagesForUpload<T extends PhotoUpload>(
   images: T[],
   maxChars: number = MAX_BATCH_BASE64_CHARS,
-  maxPhotos: number = MAX_BATCH_PHOTOS,
+  maxPhotos: number = MAX_BATCH_PHOTOS
 ): T[][] {
   const batches: T[][] = [];
   let current: T[] = [];
   let currentChars = 0;
 
   for (const img of images) {
-    const size = img.data.length;
-    if (size > maxChars)
-      throw new Error(
-        "A photo exceeds the upload size limit. Resize it before uploading.",
-      );
+    const size = "data" in img ? img.data.length : 128;
     const wouldOverflow =
       current.length > 0 &&
       (current.length >= maxPhotos || currentChars + size > maxChars);
@@ -42,8 +37,7 @@ export function chunkImagesForUpload<T extends UploadImage>(
       current = [];
       currentChars = 0;
     }
-    // An oversize single photo still ships alone rather than being dropped —
-    // one browser-resized photo can't approach the platform limit.
+    // Keep oversize single images intact; the endpoint rejects unsupported sizes.
     current = [...current, img];
     currentChars += size;
   }

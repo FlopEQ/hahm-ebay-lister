@@ -1,7 +1,9 @@
-import { parseListing, shippingSchema, skuSchema } from "@/lib/validation";
-import { verifyReview } from "@/lib/review";
+import { uploadMediaImage } from "./media";
+import { MAX_EBAY_PHOTOS } from "../photoSelection";
+import { boundedFetch, withDeadline } from "@/lib/network";
 import { validateAspects } from "./draft";
-import { boundedFetch } from "@/lib/network";
+import { signReview, verifyReview } from "@/lib/ebay/reliability";
+import { withPublishOperation, validatePublishInput, ownsInventory, recordInventory, withSkuLock, recordPendingPublish } from "@/lib/ebay/reliability";
 // eBay publish pipeline, ported from ebay_lister_v2_robust.py.
 // Sequence: upload photos → create inventory item → create offer → publish,
 // with recovery for missing item specifics, rejected conditions, and non-leaf
@@ -12,7 +14,6 @@ import {
   EBAY_CURRENCY,
   EBAY_INV_BASE,
   EBAY_MARKETPLACE_ID,
-  EBAY_TRADING,
 } from "./config";
 import {
   suggestLeafCategories,
@@ -30,83 +31,33 @@ import {
   sanitizeNumericAspects,
 } from "./aspects";
 import { fillRecommendedAspects } from "./aspectFill";
-import { applyShoeSize } from "./shoe-size";
-import {
-  extractProductIdentifiers,
-  hasCatalogIdentifier,
-  realBrand,
-} from "./identifiers";
+import { extractProductIdentifiers, hasCatalogIdentifier, realBrand } from "./identifiers";
 import { parseMeasurements } from "@/lib/measurements";
+import { cleanListingIdentifiers } from "@/lib/listingCleanup";
 import { APPAREL_CATEGORIES, PANTS_CATEGORIES } from "@/lib/categories";
-import type { ListingResult } from "@/lib/types";
+import type { EbayPolicyOption, EbayPolicyOptions, ListingResult, StagedOffer } from "@/lib/types";
 
 // ── Constants (from the Python script) ───────────────────────────────────────
 
 const CATEGORY_MAP: Record<string, string> = {
-  womens_top: "15724",
-  womens_dress: "63861",
-  womens_skirt: "11554",
-  womens_pants: "57988",
-  womens_coat: "57990",
-  womens_sweater: "63864",
-  womens_jeans: "11554",
-  womens_clothing: "15724",
-  womens_shoes: "3034",
-  mens_top: "57991",
-  mens_pants: "57989",
-  mens_coat: "57988",
-  mens_sweater: "11484",
-  mens_jeans: "11483",
-  mens_clothing: "1059",
-  mens_shoes: "93427",
-  handbag: "169291",
-  wallet: "2996",
-  jewelry: "281",
-  scarf: "45238",
-  belt: "2996",
-  sunglasses: "79720",
-  hat: "52382",
-  accessory: "4250",
-  doll: "22733",
-  collectible: "1463",
-  collector_plate: "1467",
-  toy: "2550",
-  home_decor: "10033",
-  book: "267",
-  knife: "7313",
-  sporting_goods: "159044",
-  electronics: "293",
-  camera: "625",
-  audio: "293",
-  video_game: "139973",
-  media: "11232",
-  vinyl_record: "176985",
-  cd: "176984",
-  dvd_bluray: "617",
-  musical_instrument: "619",
-  kitchenware: "20625",
-  glassware: "50693",
-  pottery_ceramics: "24",
-  art: "550",
-  craft: "14339",
-  tool: "631",
-  automotive: "6028",
-  office: "25298",
-  health_beauty: "26395",
-  small_appliance: "20667",
-  lighting: "20697",
-  linens: "20444",
-  holiday: "16086",
-  board_game: "233",
-  puzzle: "2613",
-  plush: "2624",
-  action_figure: "246",
-  trading_card: "183050",
-  sports_memorabilia: "64482",
-  coin: "11116",
-  stamp: "260",
-  ephemera: "165800",
-  other: "99",
+  womens_top: "15724", womens_dress: "63861", womens_skirt: "11554",
+  womens_pants: "57988", womens_coat: "57990", womens_sweater: "63864",
+  womens_jeans: "11554", womens_clothing: "15724", womens_shoes: "3034",
+  mens_top: "57991", mens_pants: "57989", mens_coat: "57988",
+  mens_sweater: "11484", mens_jeans: "11483", mens_clothing: "1059",
+  mens_shoes: "93427", handbag: "169291", wallet: "2996", jewelry: "281",
+  scarf: "45238", belt: "2996", sunglasses: "79720", hat: "52382",
+  accessory: "4250", doll: "22733", collectible: "1463", collector_plate: "1467",
+  toy: "2550", home_decor: "10033", book: "267", knife: "7313",
+  sporting_goods: "159044", electronics: "293", camera: "625", audio: "293",
+  video_game: "139973", media: "11232", vinyl_record: "176985", cd: "176984",
+  dvd_bluray: "617", musical_instrument: "619", kitchenware: "20625",
+  glassware: "50693", pottery_ceramics: "24", art: "550", craft: "14339",
+  tool: "631", automotive: "6028", office: "25298", health_beauty: "26395",
+  small_appliance: "20667", lighting: "20697", linens: "20444", holiday: "16086",
+  board_game: "233", puzzle: "2613", plush: "2624", action_figure: "246",
+  trading_card: "183050", sports_memorabilia: "64482", coin: "11116",
+  stamp: "260", ephemera: "165800", other: "99",
 };
 
 // NOTE: category fallbacks used to be a static list of unrelated collectible
@@ -148,10 +99,9 @@ const CONDITION_ALIASES: Record<string, string> = {
   PREOWNED_FAIR: "FAIR",
   PRE_OWNED_FAIR: "FAIR",
   USED_FAIR: "FAIR",
-  FOR_PARTS_OR_NOT_WORKING: "FOR_PARTS_OR_NOT_WORKING",
 };
 
-export const CONDITION_ID_ENUM: Record<number, string> = {
+const CONDITION_ID_ENUM: Record<number, string> = {
   1000: "NEW",
   1500: "NEW_OTHER",
   1750: "NEW_WITH_DEFECTS",
@@ -184,12 +134,18 @@ const APPAREL_CONDITION_ID_PREFERENCES: Record<string, number[]> = {
   FAIR: [3010, 3000, 2990],
 };
 
-const GENERAL_SAFE_CONDITION_IDS = [
-  3000, 4000, 5000, 6000, 2750, 1500, 1000, 1750, 7000,
-];
+const GENERAL_SAFE_CONDITION_IDS = [3000, 4000, 5000, 6000, 2750, 1500, 1000, 1750, 7000];
 const APPAREL_SAFE_CONDITION_IDS = [3000, 2990, 3010, 1500, 1000, 1750];
 
-const ASPECT_DEFAULTS: Record<string, string> = {};
+const ASPECT_DEFAULTS: Record<string, string> = {
+  "Skirt Length": "Knee-Length", "Dress Length": "Knee-Length", Rise: "Mid Rise",
+  "Leg Style": "Straight", Closure: "Pull-On", "Shoe Width": "Medium",
+  "Heel Height": "Flat", "Toe Shape": "Round", Adjustable: "Yes",
+  "Exterior Pockets": "Yes", Lining: "Lined", Hood: "No Hood", "Bag Closure": "Zip",
+  "Strap Type": "Adjustable", "Hat Style": "Baseball Cap", "Brim Style": "Curved Bill",
+  "Size Type": "Regular", Style: "Casual", Department: "Unisex Adult",
+  Type: "Item", Brand: "Unbranded", Color: "Multicolor", Material: "Mixed Materials",
+};
 
 // eBay's size standardization (enforced July 2026) blocks or holds listings
 // whose Size is a placeholder or non-standard value, so size aspects are only
@@ -221,7 +177,7 @@ async function ebayRequest(
   accessToken: string,
   method: string,
   url: string,
-  opts: { body?: unknown; extraHeaders?: Record<string, string> } = {},
+  opts: { body?: unknown; extraHeaders?: Record<string, string> } = {}
 ): Promise<EbayResp> {
   const resp = await boundedFetch(url, {
     method,
@@ -253,12 +209,11 @@ async function ebayRequest(
 // price to $29.99 → $35.39 — hiding unidentified items behind a made-up
 // number instead of stopping for review.) Returns null when there is no
 // usable price, which blocks the publish with an actionable error.
-export function validListingPrice(
-  raw: number | string | undefined,
-): number | null {
+export function validListingPrice(raw: number | string | undefined): number | null {
   const base = typeof raw === "string" ? Number(raw) : raw;
   if (base === undefined || !Number.isFinite(base) || base <= 0) return null;
-  return Math.round(base * 100) / 100;
+  const rounded = Math.round(base * 100) / 100;
+  return Number.isFinite(rounded) && rounded > 0 ? rounded : null;
 }
 
 // eBay's CALCULATED-shipping business policies REQUIRE package weight (and
@@ -288,16 +243,8 @@ interface PackageProfile {
 const DEFAULT_PACKAGE: PackageProfile = { oz: 16, l: 12, w: 9, h: 3 };
 
 const PACKAGE_PROFILES: Record<string, PackageProfile> = (() => {
-  const size = (
-    oz: number,
-    l: number,
-    w: number,
-    h: number,
-  ): PackageProfile => ({
-    oz,
-    l,
-    w,
-    h,
+  const size = (oz: number, l: number, w: number, h: number): PackageProfile => ({
+    oz, l, w, h,
   });
   const profiles: Record<string, PackageProfile> = {};
   const assign = (keys: string[], p: PackageProfile) =>
@@ -306,44 +253,18 @@ const PACKAGE_PROFILES: Record<string, PackageProfile> = (() => {
   assign(["womens_shoes", "mens_shoes"], size(48, 14, 10, 6));
   assign(["handbag"], size(24, 14, 11, 4));
   assign(
-    [
-      "small_appliance",
-      "electronics",
-      "camera",
-      "audio",
-      "musical_instrument",
-      "tool",
-      "automotive",
-      "kitchenware",
-      "sporting_goods",
-    ],
-    size(48, 14, 11, 6),
+    ["small_appliance", "electronics", "camera", "audio", "musical_instrument", "tool", "automotive", "kitchenware", "sporting_goods"],
+    size(48, 14, 11, 6)
   );
   assign(["art", "collector_plate"], size(48, 20, 16, 4));
-  assign(
-    [
-      "glassware",
-      "pottery_ceramics",
-      "doll",
-      "collectible",
-      "holiday",
-      "home_decor",
-      "lighting",
-    ],
-    size(32, 12, 10, 8),
-  );
-  assign(
-    ["book", "media", "cd", "dvd_bluray", "video_game"],
-    size(12, 12, 9, 2),
-  );
+  assign(["glassware", "pottery_ceramics", "doll", "collectible", "holiday", "home_decor", "lighting"], size(32, 12, 10, 8));
+  assign(["book", "media", "cd", "dvd_bluray", "video_game"], size(12, 12, 9, 2));
   assign(["vinyl_record"], size(16, 14, 14, 2));
   assign(["linens", "plush"], size(20, 14, 11, 4));
   return profiles;
 })();
 
-export function defaultPackageWeightAndSize(
-  catKey: string,
-): Record<string, unknown> {
+export function defaultPackageWeightAndSize(catKey: string): Record<string, unknown> {
   const profile = PACKAGE_PROFILES[catKey] ?? DEFAULT_PACKAGE;
   const num = (v: string | undefined, fallback: number) => {
     const n = Number(v);
@@ -364,6 +285,35 @@ export function defaultPackageWeightAndSize(
   };
 }
 
+function positiveNumber(raw: number | string | undefined): number | null {
+  const n = typeof raw === "string" ? Number(raw) : raw;
+  return n !== undefined && Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export function packageWeightAndSizeForListing(
+  catKey: string,
+  listing: ListingResult
+): Record<string, unknown> {
+  const base = defaultPackageWeightAndSize(catKey) as {
+    weight: { value: number; unit: "OUNCE" };
+    dimensions: { length: number; width: number; height: number; unit: "INCH" };
+    packageType: string;
+  };
+  return {
+    weight: {
+      value: positiveNumber(listing.package_weight_oz) ?? base.weight.value,
+      unit: "OUNCE",
+    },
+    dimensions: {
+      length: positiveNumber(listing.package_length_in) ?? base.dimensions.length,
+      width: positiveNumber(listing.package_width_in) ?? base.dimensions.width,
+      height: positiveNumber(listing.package_height_in) ?? base.dimensions.height,
+      unit: "INCH",
+    },
+    packageType: base.packageType,
+  };
+}
+
 function normalizeConditionInput(value: string | undefined): string {
   const cleaned = (value || "GOOD")
     .trim()
@@ -381,39 +331,38 @@ function isApparelConditionPolicy(acceptedIds: Set<number>): boolean {
 function conditionIdsForGrade(
   grade: string,
   acceptedIds: Set<number>,
-  catKey: string,
+  catKey: string
 ): number[] {
-  if (!acceptedIds.size) return [];
-  let id: number | undefined;
-  if (grade === "FOR_PARTS_OR_NOT_WORKING") id = 7000;
-  else if (grade === "NEW_WITH_TAGS") id = 1000;
-  else if (grade === "NEW_NO_TAGS") id = 1500;
-  else if (isApparelConditionPolicy(acceptedIds))
-    id = (
-      { EXCELLENT: 2990, VERY_GOOD: 3000, GOOD: 3000, FAIR: 3010 } as Record<
-        string,
-        number
-      >
-    )[grade];
-  else if (![2750, 4000, 5000, 6000].some((n) => acceptedIds.has(n)))
-    id = 3000; // broad Used category
-  else
-    id = (
-      { EXCELLENT: 2750, VERY_GOOD: 4000, GOOD: 5000, FAIR: 6000 } as Record<
-        string,
-        number
-      >
-    )[grade];
-  return id && acceptedIds.has(id) ? [id] : [];
+  // When eBay's condition metadata is unavailable, fall back to the category
+  // key so apparel still prefers 2990 (Pre-owned – Excellent). Without this,
+  // a silent metadata failure sent every clothing item as id 3000 — which eBay
+  // displays as "Pre-owned – Good" in fashion categories, whatever the grade.
+  const apparel =
+    isApparelConditionPolicy(acceptedIds) ||
+    (!acceptedIds.size && APPAREL_CATEGORIES.has(catKey));
+  const preferences = apparel ? APPAREL_CONDITION_ID_PREFERENCES : GENERAL_CONDITION_ID_PREFERENCES;
+  const safeIds = apparel ? APPAREL_SAFE_CONDITION_IDS : GENERAL_SAFE_CONDITION_IDS;
+  const preferred = preferences[grade] || preferences.GOOD;
+
+  if (!acceptedIds.size) return preferred;
+
+  const out: number[] = [];
+  const add = (id: number) => {
+    if (acceptedIds.has(id) && CONDITION_ID_ENUM[id] && !out.includes(id)) out.push(id);
+  };
+  for (const id of preferred) add(id);
+  for (const id of safeIds) add(id);
+  for (const id of acceptedIds) add(id);
+  return out.length ? out : preferred;
 }
 
 // Ordered eBay Inventory condition enums to try for an internal grade. The grade
 // comes from photo analysis; the allowed IDs come from the chosen leaf category's
 // Metadata policy, so apparel/books/electronics/etc. can each resolve differently.
-export function conditionCandidates(
+function conditionCandidates(
   grade: string | undefined,
   acceptedIds: Set<number>,
-  catKey: string,
+  catKey: string
 ): string[] {
   const desired = normalizeConditionInput(grade);
   const out: string[] = [];
@@ -421,7 +370,7 @@ export function conditionCandidates(
     const en = CONDITION_ID_ENUM[id];
     if (en && !out.includes(en)) out.push(en);
   }
-  return out;
+  return out.length ? out : ["USED_GOOD"];
 }
 
 // Offline/static category resolution — used only when eBay's Taxonomy
@@ -441,7 +390,7 @@ function singleValue(v: unknown): string {
 function departmentForCategory(catKey: string): string {
   if (catKey.startsWith("womens_")) return "Women";
   if (catKey.startsWith("mens_")) return "Men";
-  return "";
+  return "Unisex Adult";
 }
 
 // Build the item-specifics (aspects) map from the listing. Values are kept as
@@ -449,10 +398,7 @@ function departmentForCategory(catKey: string): string {
 // aspect metadata arrives, enforceCardinality() trims single-value aspects.
 // Placeholder phrases ("See tag in photos") never become aspect values —
 // cleanAspectValue/splitAspectValues drop them at the door.
-export function buildAspects(
-  listing: ListingResult,
-  catKey: string,
-): Record<string, string[]> {
+function buildAspects(listing: ListingResult, catKey: string): Record<string, string[]> {
   const aspects: Record<string, string[]> = {};
   const putOne = (k: string, v: string) => {
     const val = cleanAspectValue(v);
@@ -470,22 +416,19 @@ export function buildAspects(
   putOne("Type", String(listing.item_type || "").trim());
 
   const feats = Array.isArray(listing.key_features) ? listing.key_features : [];
-  const cleanFeats = feats
-    .map((f) => cleanAspectValue(String(f)))
-    .filter(Boolean)
-    .slice(0, 5);
+  const cleanFeats = feats.map((f) => cleanAspectValue(String(f))).filter(Boolean).slice(0, 5);
   if (cleanFeats.length) aspects.Features = cleanFeats;
 
-  if (departmentForCategory(catKey))
+  if (APPAREL_CATEGORIES.has(catKey) || catKey === "accessory") {
     aspects.Department = [departmentForCategory(catKey)];
+  }
 
   // Measurements go to eBay aspects only when explicitly labeled — never the
   // whole free-text blob (which once produced Inseam = "Waist 32 in, rise 11…").
   if (PANTS_CATEGORIES.has(catKey)) {
     const parsed = parseMeasurements(listing.measurements);
     if (parsed.inseam) aspects.Inseam = [parsed.inseam];
-    if (parsed.waist && !aspects["Waist Size"])
-      aspects["Waist Size"] = [parsed.waist];
+    if (parsed.waist && !aspects["Waist Size"]) aspects["Waist Size"] = [parsed.waist];
     if (parsed.rise && !aspects.Rise) aspects.Rise = [parsed.rise];
   }
 
@@ -493,7 +436,7 @@ export function buildAspects(
   for (const [k, v] of Object.entries(listing.item_specifics || {})) {
     if (!k || k.startsWith("---")) continue;
     const vals = splitAspectValues(v);
-    if (vals.length && !aspects[k]) aspects[k] = vals;
+    if (vals.length) aspects[k] = vals;
   }
   return aspects;
 }
@@ -507,17 +450,11 @@ export function buildAspects(
 // Choose a valid Department from the category's own allowed values, biased by
 // the item's gender cues. Kids categories only allow Boys/Girls/Unisex Kids, so
 // a blind "Unisex Adults" default would still fail — we match against the list.
-function pickDepartment(
-  allowed: string[],
-  listing: ListingResult,
-  catKey: string,
-): string {
+function pickDepartment(allowed: string[], listing: ListingResult, catKey: string): string {
   const text = `${catKey} ${listing.title || ""} ${listing.item_type || ""} ${
     listing.item_specifics?.Department || ""
   }`.toLowerCase();
-  const women =
-    catKey.startsWith("womens_") ||
-    /\b(women|woman|ladies|female|girl)\b/.test(text);
+  const women = catKey.startsWith("womens_") || /\b(women|woman|ladies|female|girl)\b/.test(text);
   const men = catKey.startsWith("mens_") || /\b(men|man|male|boy)\b/.test(text);
   const pref = women
     ? ["Women", "Women's", "Girls", "Unisex Adults", "Unisex Kids", "Unisex"]
@@ -539,35 +476,57 @@ function pickDepartment(
 function freeTextDefault(name: string, listing: ListingResult): string {
   const n = name.toLowerCase();
   const clean = (v: unknown) => cleanAspectValue(String(v ?? "").trim());
-  if (n.includes("brand")) return clean(listing.brand);
-  if (n.includes("color")) return singleValue(listing.color);
+  if (n.includes("brand")) return clean(listing.brand) || "Unbranded";
+  if (n.includes("color")) return singleValue(listing.color) || "Multicolor";
   if (n.includes("shoe size") || n === "size") return cleanSize(listing.size);
   if (n.includes("material")) return singleValue(listing.material);
-  if (n.includes("style"))
-    return clean(listing.item_specifics?.Style || listing.item_type);
+  if (n.includes("style")) return clean(listing.item_specifics?.Style || listing.item_type);
   if (n.includes("type")) return clean(listing.item_type);
   return "";
 }
 
 // Make every REQUIRED aspect present and valid. Mutates `aspects` in place.
-export function reconcileAspects(
+function reconcileAspects(
   aspects: Record<string, string[]>,
   meta: AspectMeta[],
   listing: ListingResult,
-  catKey: string,
+  catKey: string
 ): void {
-  canonicalizeAspectKeys(aspects, meta);
-  applyShoeSize(aspects, meta, cleanSize(listing.size), catKey);
-  // Missing facts stay missing. Legal values are not evidence.
   for (const a of meta) {
-    const values = aspects[a.name];
-    if (!values) continue;
+    if (!a.required || !a.name) continue;
+    const current = aspects[a.name] ?? [];
+
     if (a.mode === "SELECTION_ONLY") {
-      const valid = values
-        .map((v) => matchAllowed(v, a.values))
-        .filter((v): v is string => Boolean(v));
-      if (valid.length) aspects[a.name] = valid;
-      else delete aspects[a.name];
+      // Must be one of eBay's allowed values, or the publish 25002-fails.
+      // Keep every valid value the listing already has (MULTI aspects may
+      // legitimately carry several).
+      const valid: string[] = [];
+      for (const v of current) {
+        const m = matchAllowed(v, a.values);
+        if (m && !valid.includes(m)) valid.push(m);
+      }
+      if (valid.length) {
+        aspects[a.name] = valid;
+        continue;
+      }
+      // Size aspects never fall back to a guessed value — a wrong size
+      // mislabels the item and trips eBay's standardization enforcement.
+      const canonical = isSizeAspect(a.name)
+        ? ""
+        : matchAllowed(ASPECT_DEFAULTS[a.name] || "", a.values) ||
+          (a.name === "Department" ? pickDepartment(a.values, listing, catKey) : "") ||
+          a.values[0] ||
+          "";
+      if (canonical) aspects[a.name] = [canonical];
+      else if (isSizeAspect(a.name)) delete aspects[a.name];
+    } else if (!current.length) {
+      // FREE_TEXT and unset — fill from the listing or a sensible default.
+      const fromListing = freeTextDefault(a.name, listing);
+      const v =
+        fromListing ||
+        (isSizeAspect(a.name) ? "" : ASPECT_DEFAULTS[a.name] || a.values[0] || "");
+      const clipped = clipAspectValue(v, a.maxLength);
+      if (clipped) aspects[a.name] = [clipped];
     }
   }
 }
@@ -596,21 +555,15 @@ function isTransientEbayError(r: EbayResp): boolean {
 async function withTransientRetry(
   call: () => Promise<EbayResp>,
   label: string,
-  sku: string,
+  sku: string
 ): Promise<EbayResp> {
   let r = await call();
-  for (
-    let attempt = 1;
-    attempt <= TRANSIENT_RETRIES && isTransientEbayError(r);
-    attempt++
-  ) {
+  for (let attempt = 1; attempt <= TRANSIENT_RETRIES && isTransientEbayError(r); attempt++) {
     console.warn(
       `[ebay/publish] sku=${sku} ${label} hit transient eBay error ` +
-        `(status=${r.status} ids=${errorIds(r).join(",") || "none"}) — retry ${attempt}/${TRANSIENT_RETRIES}`,
+        `(status=${r.status} ids=${errorIds(r).join(",") || "none"}) — retry ${attempt}/${TRANSIENT_RETRIES}`
     );
-    await new Promise((res) =>
-      setTimeout(res, TRANSIENT_BASE_DELAY_MS * 2 ** (attempt - 1)),
-    );
+    await new Promise((res) => setTimeout(res, TRANSIENT_BASE_DELAY_MS * 2 ** (attempt - 1)));
     r = await call();
   }
   return r;
@@ -644,7 +597,7 @@ function primaryEbayError(r: EbayResp): { errorId: number; message: string } {
 function logPublishFailure(stage: string, sku: string, r: EbayResp): void {
   const { errorId, message } = primaryEbayError(r);
   console.error(
-    `[ebay/publish] ${stage} failed sku=${sku} http=${r.status} errorId=${errorId || "?"} ${message}`,
+    `[ebay/publish] ${stage} failed sku=${sku} http=${r.status} errorId=${errorId || "?"} ${message}`
   );
 }
 
@@ -653,9 +606,7 @@ function logPublishFailure(stage: string, sku: string, r: EbayResp): void {
 function publishErrorMessage(stage: string, r: EbayResp): string {
   const { errorId, message } = primaryEbayError(r);
   const detail = message || `HTTP ${r.status}`;
-  const head = errorId
-    ? `${stage} (eBay error ${errorId}): ${detail}`
-    : `${stage} (${r.status}): ${detail}`;
+  const head = errorId ? `${stage} (eBay error ${errorId}): ${detail}` : `${stage} (${r.status}): ${detail}`;
   const hint = errorId ? EBAY_ERROR_HINTS[errorId] : undefined;
   return hint ? `${head} ${hint}` : head;
 }
@@ -675,7 +626,7 @@ function extractMissingAspects(r: EbayResp): string[] {
   const missing: string[] = [];
   for (const err of r.json?.errors || []) {
     const pieces = [err.message, err.longMessage].concat(
-      (err.parameters || []).map((p: any) => String(p.value || "")),
+      (err.parameters || []).map((p: any) => String(p.value || ""))
     );
     const hay = pieces.join(" | ");
     const re = /item specific ([^|.,;]+?) is missing/gi;
@@ -691,7 +642,7 @@ function extractMissingAspects(r: EbayResp): string[] {
 function addMissingAspects(
   aspects: Record<string, string[]>,
   missing: string[],
-  listing: ListingResult,
+  listing: ListingResult
 ): string[] {
   const added: string[] = [];
   for (const field of missing) {
@@ -726,14 +677,13 @@ function escapeRegExp(s: string): string {
 
 export function findInvalidValueAspects(
   r: EbayResp,
-  aspects: Record<string, string[]>,
+  aspects: Record<string, string[]>
 ): string[] {
   const hits: string[] = [];
   for (const err of r.json?.errors || []) {
     for (const piece of [err.message, err.longMessage]) {
       const msg = String(piece || "");
-      if (!msg || !ASPECT_VALUE_ERROR_RE.test(msg) || /is missing/i.test(msg))
-        continue;
+      if (!msg || !ASPECT_VALUE_ERROR_RE.test(msg) || /is missing/i.test(msg)) continue;
       for (const name of Object.keys(aspects)) {
         if (name.length < 3) continue;
         const re = new RegExp(`\\b${escapeRegExp(name)}\\b`, "i");
@@ -752,13 +702,13 @@ export function applyInvalidAspectFallback(
   inventoryItem: { product: { aspects?: Record<string, string[]> } },
   aspects: Record<string, string[]>,
   names: string[],
-  sku: string,
+  sku: string
 ): void {
   for (const n of names) {
     console.warn(
       `[ebay/publish] sku=${sku} eBay rejected the value of aspect "${n}" (${JSON.stringify(
-        aspects[n] ?? [],
-      )}) — retrying without it`,
+        aspects[n] ?? []
+      )}) — retrying without it`
     );
     delete aspects[n];
   }
@@ -776,26 +726,18 @@ export function isBrandMpnError(r: EbayResp): boolean {
 // back to eBay's own aspect conventions — a Brand (or "Unbranded") plus MPN
 // "Does Not Apply". Both are canonical eBay values, not placeholders.
 export function applyBrandMpnFallback(
-  inventoryItem: {
-    product: {
-      aspects?: Record<string, string[]>;
-      brand?: string;
-      mpn?: string;
-    };
-  },
+  inventoryItem: { product: { aspects?: Record<string, string[]>; brand?: string; mpn?: string } },
   aspects: Record<string, string[]>,
   listing: ListingResult,
-  sku: string,
+  sku: string
 ): void {
   console.warn(
-    `[ebay/publish] sku=${sku} eBay rejected the Brand/MPN pair (<BrandMPN>) — retrying with aspect-level fallbacks`,
+    `[ebay/publish] sku=${sku} eBay rejected the Brand/MPN pair (<BrandMPN>) — retrying with aspect-level fallbacks`
   );
   delete inventoryItem.product.brand;
   delete inventoryItem.product.mpn;
   if (!aspects.Brand?.length) {
-    aspects.Brand = [
-      cleanAspectValue(String(listing.brand || "").trim()) || "Unbranded",
-    ];
+    aspects.Brand = [cleanAspectValue(String(listing.brand || "").trim()) || "Unbranded"];
   }
   if (!aspects.MPN?.length) aspects.MPN = ["Does Not Apply"];
   inventoryItem.product.aspects = aspects;
@@ -805,10 +747,7 @@ export function applyBrandMpnFallback(
 // "Invalid <ShippingPackage>") — e.g. an enum value that exists in the
 // Inventory API schema but isn't accepted by eBay US.
 export function isShippingPackageError(r: EbayResp): boolean {
-  return (
-    errorIds(r).includes(25101) ||
-    /Invalid\s*<?ShippingPackage/i.test(r.text || "")
-  );
+  return errorIds(r).includes(25101) || /Invalid\s*<?ShippingPackage/i.test(r.text || "");
 }
 
 // Recovery for a rejected package: first snap the type to the one value eBay
@@ -817,72 +756,25 @@ export function isShippingPackageError(r: EbayResp): boolean {
 // then surface eBay's clearer "package weight is missing" (25020) instead.
 export function applyShippingPackageFallback(
   inventoryItem: { packageWeightAndSize?: { packageType?: string } },
-  sku: string,
+  sku: string
 ): void {
   const pkg = inventoryItem.packageWeightAndSize;
   if (pkg && pkg.packageType !== SAFE_PACKAGE_TYPE) {
     console.warn(
-      `[ebay/publish] sku=${sku} eBay rejected packageType ${pkg.packageType} — retrying as ${SAFE_PACKAGE_TYPE}`,
+      `[ebay/publish] sku=${sku} eBay rejected packageType ${pkg.packageType} — retrying as ${SAFE_PACKAGE_TYPE}`
     );
     pkg.packageType = SAFE_PACKAGE_TYPE;
   } else {
     console.warn(
-      `[ebay/publish] sku=${sku} eBay rejected the shipping package — retrying without packageWeightAndSize`,
+      `[ebay/publish] sku=${sku} eBay rejected the shipping package — retrying without packageWeightAndSize`
     );
     delete inventoryItem.packageWeightAndSize;
   }
 }
 
-function updateOfferBody(
-  offer: Record<string, unknown>,
-): Record<string, unknown> {
+function updateOfferBody(offer: Record<string, unknown>): Record<string, unknown> {
   const skip = new Set(["sku", "marketplaceId", "format"]);
-  return Object.fromEntries(
-    Object.entries(offer).filter(([k]) => !skip.has(k)),
-  );
-}
-
-// ── Photo upload to eBay Picture Services (Trading API, XML) ──────────────────
-
-async function uploadPhoto(
-  accessToken: string,
-  base64: string,
-  mediaType: string,
-  name: string,
-): Promise<string | null> {
-  const xml = `<?xml version="1.0" encoding="utf-8"?>
-<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <PictureName>${name.slice(0, 50)}</PictureName>
-  <PictureUploadPolicy>ClearAndNew</PictureUploadPolicy>
-</UploadSiteHostedPicturesRequest>`;
-
-  const data = base64.includes(",") ? base64.split(",")[1] : base64;
-  const bytes = Buffer.from(data, "base64");
-  const form = new FormData();
-  form.append(
-    "XML Payload",
-    new Blob([xml], { type: "text/xml;charset=utf-8" }),
-    "payload.xml",
-  );
-  form.append(
-    "image",
-    new Blob([new Uint8Array(bytes)], { type: mediaType }),
-    name,
-  );
-
-  const resp = await boundedFetch(EBAY_TRADING, {
-    method: "POST",
-    headers: {
-      "X-EBAY-API-SITEID": "0",
-      "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
-      "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-      "X-EBAY-API-IAF-TOKEN": accessToken,
-    },
-    body: form,
-  });
-  const text = await resp.text();
-  const m = text.match(/<FullURL>([^<]+)<\/FullURL>/);
-  return m ? m[1] : null;
+  return Object.fromEntries(Object.entries(offer).filter(([k]) => !skip.has(k)));
 }
 
 // ── Policies & location ──────────────────────────────────────────────────────
@@ -894,65 +786,119 @@ export interface AccountSetup {
   locationKey: string;
 }
 
-export interface AccountOptions {
-  fulfillment: { id: string; name: string }[];
-  payment: { id: string; name: string }[];
-  returns: { id: string; name: string }[];
-  locations: { id: string; name: string }[];
+function pickFirstPolicy(r: EbayResp, listKey: string, idField: string): string {
+  if (!r.ok) return "";
+  const list = r.json?.[listKey] || [];
+  return list.length ? String(list[0][idField] || "") : "";
 }
-export async function fetchAccountOptions(
-  accessToken: string,
-): Promise<AccountOptions> {
-  const mp = "marketplace_id=" + EBAY_MARKETPLACE_ID;
-  const results = await Promise.all([
-    ebayRequest(
-      accessToken,
-      "GET",
-      EBAY_ACC_BASE + "/fulfillment_policy?" + mp,
-    ),
-    ebayRequest(accessToken, "GET", EBAY_ACC_BASE + "/payment_policy?" + mp),
-    ebayRequest(accessToken, "GET", EBAY_ACC_BASE + "/return_policy?" + mp),
-    ebayRequest(accessToken, "GET", EBAY_INV_BASE + "/location?limit=100"),
+
+function policyOptions(r: EbayResp, listKey: string, idField: string): EbayPolicyOption[] {
+  if (!r.ok) return [];
+  const list = r.json?.[listKey] || [];
+  return list
+    .map((p: any) => {
+      const id = String(p?.[idField] || "");
+      return {
+        id,
+        name: String(p?.name || p?.policyName || id),
+      };
+    })
+    .filter((p: EbayPolicyOption) => p.id);
+}
+
+// Policies and location change rarely; refetching them for every item of a
+// batch adds four eBay calls per publish. Cache per access token for 10 min.
+const setupCache = new Map<string, { setup: AccountSetup; expiresAt: number }>();
+const SETUP_TTL_MS = 10 * 60_000;
+
+export async function fetchAccountSetup(accessToken: string): Promise<AccountSetup> {
+  const cached = setupCache.get(accessToken);
+  if (cached && cached.expiresAt > Date.now()) return cached.setup;
+  const setup = await fetchAccountSetupUncached(accessToken);
+  // Only cache complete setups — a transient miss shouldn't stick for 10 min.
+  if (setup.fulfillmentPolicyId && setup.paymentPolicyId && setup.returnPolicyId) {
+    if (setupCache.size > 50) setupCache.clear();
+    setupCache.set(accessToken, { setup, expiresAt: Date.now() + SETUP_TTL_MS });
+  }
+  return setup;
+}
+
+async function fetchAccountSetupUncached(accessToken: string): Promise<AccountSetup> {
+  const mp = `marketplace_id=${EBAY_MARKETPLACE_ID}`;
+  const [ful, pay, ret] = await Promise.all([
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/fulfillment_policy?${mp}`),
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/payment_policy?${mp}`),
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/return_policy?${mp}`),
   ]);
-  if (results.some((r) => !r.ok))
-    throw new Error(
-      "Could not load all eBay policies and locations. Reconnect or retry.",
-    );
-  const rows = (r: EbayResp, key: string, id: string) =>
-    (r.json?.[key] ?? []).map((x: any) => ({
-      id: String(x[id]),
-      name: String(x.name || x[id]),
-    }));
   return {
-    fulfillment: rows(results[0], "fulfillmentPolicies", "fulfillmentPolicyId"),
-    payment: rows(results[1], "paymentPolicies", "paymentPolicyId"),
-    returns: (results[2].json?.returnPolicies ?? [])
-      .filter((policy: any) => policy.returnsAccepted === true)
-      .map((policy: any) => ({
-        id: String(policy.returnPolicyId),
-        name: String(policy.name || policy.returnPolicyId),
-      })),
-    locations: (results[3].json?.locations ?? [])
-      .filter((x: any) => x.merchantLocationStatus === "ENABLED")
-      .map((x: any) => ({
-        id: String(x.merchantLocationKey),
-        name: [
-          x.name,
-          x.location?.address?.postalCode,
-          x.location?.address?.country,
-        ]
-          .filter(Boolean)
-          .join(" · "),
-      })),
+    fulfillmentPolicyId: pickFirstPolicy(ful, "fulfillmentPolicies", "fulfillmentPolicyId"),
+    paymentPolicyId: pickFirstPolicy(pay, "paymentPolicies", "paymentPolicyId"),
+    returnPolicyId: pickFirstPolicy(ret, "returnPolicies", "returnPolicyId"),
+    locationKey: await fetchOrCreateLocation(accessToken),
   };
+}
+
+export async function fetchAccountPolicyOptions(
+  accessToken: string
+): Promise<EbayPolicyOptions> {
+  const mp = `marketplace_id=${EBAY_MARKETPLACE_ID}`;
+  const [ful, pay, ret] = await Promise.all([
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/fulfillment_policy?${mp}`),
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/payment_policy?${mp}`),
+    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/return_policy?${mp}`),
+  ]);
+  const fulfillmentPolicies = policyOptions(ful, "fulfillmentPolicies", "fulfillmentPolicyId");
+  const paymentPolicies = policyOptions(pay, "paymentPolicies", "paymentPolicyId");
+  const returnPolicies = policyOptions(ret, "returnPolicies", "returnPolicyId");
+  return {
+    fulfillmentPolicies,
+    paymentPolicies,
+    returnPolicies,
+    defaults: {
+      fulfillmentPolicyId: fulfillmentPolicies[0]?.id || "",
+      paymentPolicyId: paymentPolicies[0]?.id || "",
+      returnPolicyId: returnPolicies[0]?.id || "",
+    },
+  };
+}
+
+async function fetchOrCreateLocation(accessToken: string): Promise<string> {
+  const list = await ebayRequest(accessToken, "GET", `${EBAY_INV_BASE}/location`);
+  if (list.ok) {
+    for (const loc of list.json?.locations || []) {
+      if (loc.merchantLocationStatus === "ENABLED" && loc.merchantLocationKey) {
+        return loc.merchantLocationKey;
+      }
+    }
+  }
+  if (!list.ok) throw new Error("Could not verify your shipping origin. Retry later.");
+  const postalCode = process.env.EBAY_LOCATION_POSTAL_CODE?.trim();
+  if (!postalCode) throw new Error("Create an eBay inventory location or set EBAY_LOCATION_POSTAL_CODE to your actual ZIP code.");
+  const key = "HOME_OFFICE";
+  const payload = {
+    name: "Home Office",
+    merchantLocationStatus: "ENABLED",
+    locationTypes: ["WAREHOUSE"],
+    location: {
+      address: {
+        // Set EBAY_LOCATION_POSTAL_CODE to your own ZIP. Only used the first
+        // time, to create an inventory location if you don't already have one.
+        postalCode,
+        country: "US",
+      },
+    },
+  };
+  const created = await ebayRequest(accessToken, "POST", `${EBAY_INV_BASE}/location/${key}`, {
+    body: payload,
+    extraHeaders: { "Content-Language": "en-US" },
+  });
+  if (!created.ok) throw new Error("eBay could not create your shipping origin. Check the ZIP and account settings.");
+  return key;
 }
 
 // ── The full publish flow for one item ───────────────────────────────────────
 
 export interface PublishInput {
-  shipping?: import("@/lib/validation").ShippingSelection;
-  review?: { categoryId: string; expiresAt: number; signature: string };
-  expectedPhotoCount?: number;
   sku: string;
   listing: ListingResult;
   // Base64 photos to upload to eBay in this request (legacy single-request
@@ -961,6 +907,12 @@ export interface PublishInput {
   // eBay-hosted photo URLs from /api/ebay/upload-photos. The preferred flow:
   // photos ship in small batches beforehand, so the publish body stays tiny.
   imageUrls?: string[];
+  expectedPhotoCount?: number;
+  requestId?: string;
+  accountScope?: string;
+  // Set only from the server's interrupted-operation receipt.
+  reconcileOfferId?: string;
+  review?: { categoryId: string; expiresAt: number; signature: string };
 }
 
 // Only accept photo URLs that eBay Picture Services itself minted — anything
@@ -974,12 +926,13 @@ export function sanitizeEbayImageUrls(urls: unknown): string[] {
       const u = new URL(raw);
       const host = u.hostname.toLowerCase();
       const isEps = host === "ebayimg.com" || host.endsWith(".ebayimg.com");
-      if (u.protocol === "https:" && isEps && !out.includes(raw)) out.push(raw);
+      if (u.protocol === "https:" && isEps && !u.username && !u.password &&
+          (!u.port || u.port === "443") && !out.includes(raw)) out.push(raw);
     } catch {
       /* not a URL — skip */
     }
   }
-  return out.slice(0, 24);
+  return out.slice(0, MAX_EBAY_PHOTOS);
 }
 
 export interface PublishResult {
@@ -987,6 +940,7 @@ export interface PublishResult {
   sku: string;
   listingId?: string;
   offerId?: string;
+  draft?: boolean;
   error?: string;
   // The SKU already has a LIVE eBay listing — a duplicate bin batch, not a
   // transient failure. The client uses this to avoid clobbering the earlier item.
@@ -997,13 +951,109 @@ export interface PublishResult {
   warnings?: string[];
 }
 
+function offerToStagedOffer(raw: any): StagedOffer {
+  const price = raw?.pricingSummary?.price;
+  return {
+    offerId: String(raw?.offerId || ""),
+    sku: String(raw?.sku || ""),
+    status: String(raw?.status || "UNKNOWN"),
+    title: raw?.listingDescription ? String(raw.listingDescription).slice(0, 120) : undefined,
+    price: price?.value !== undefined ? String(price.value) : undefined,
+    currency: price?.currency ? String(price.currency) : undefined,
+    listingId: raw?.listing?.listingId ? String(raw.listing.listingId) : undefined,
+  };
+}
+
+export async function listStagedOffers(accessToken: string): Promise<StagedOffer[]> {
+  const r = await ebayRequest(
+    accessToken,
+    "GET",
+    `${EBAY_INV_BASE}/offer?marketplace_id=${EBAY_MARKETPLACE_ID}&limit=200`
+  );
+  if (!r.ok) throw new Error(publishErrorMessage("Could not load staged offers", r));
+  return (r.json?.offers ?? [])
+    .map(offerToStagedOffer)
+    .filter((o: StagedOffer) => o.offerId && o.status.toUpperCase() !== "PUBLISHED");
+}
+
+export async function deleteStagedOffer(accessToken: string, offerId: string): Promise<PublishResult> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(offerId)) throw new Error("Invalid offer ID.");
+  const url = `${EBAY_INV_BASE}/offer/${encodeURIComponent(offerId)}`;
+  const initial = await ebayRequest(accessToken,"GET",url);
+  if (!initial.ok || !initial.json?.sku) throw new Error("Could not verify this staged offer. Retry later.");
+  const sku = String(initial.json.sku);
+  return withSkuLock(sku,async () => {
+    const offer = await ebayRequest(accessToken,"GET",url);
+    if (!offer.ok || offer.json?.sku !== sku || offer.json?.status !== "UNPUBLISHED")
+      throw new Error("Only a verified unpublished offer can be deleted from staged offers.");
+    const r = await ebayRequest(accessToken,"DELETE",url);
+    return r.ok ? {success:true,sku,offerId,draft:true} : {success:false,sku,offerId,error:publishErrorMessage("Could not delete staged offer",r)};
+  });
+}
+
+export async function publishStagedOffer(accessToken: string, offerId: string): Promise<PublishResult> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(offerId)) throw new Error("Invalid offer ID.");
+  const offer = await ebayRequest(accessToken,"GET",`${EBAY_INV_BASE}/offer/${encodeURIComponent(offerId)}`);
+  if (!offer.ok || !offer.json?.sku) throw new Error("Could not verify this staged offer. Retry later.");
+  return withSkuLock(String(offer.json.sku),() => withDeadline(240_000,() => publishVerifiedStagedOffer(accessToken,offerId)));
+}
+async function publishVerifiedStagedOffer(accessToken: string, offerId: string): Promise<PublishResult> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(offerId)) throw new Error("Invalid offer ID.");
+  const url = `${EBAY_INV_BASE}/offer/${encodeURIComponent(offerId)}`;
+  const current = await ebayRequest(accessToken,"GET",url);
+  if (!current.ok || !current.json?.sku) throw new Error("Could not verify this staged offer. Retry later.");
+  const sku = String(current.json.sku);
+  if (current.json.status === "PUBLISHED" && current.json.listing?.listingId)
+    return {success:true,sku,offerId,listingId:String(current.json.listing.listingId)};
+  if (current.json.status !== "UNPUBLISHED")
+    throw new Error("This offer's publication state is unconfirmed. Check it on eBay before retrying.");
+  const categoryId = String(current.json.categoryId || "");
+  if (!/^\d+$/.test(categoryId) || validListingPrice(current.json.pricingSummary?.price?.value) === null)
+    throw new Error("The staged offer needs a category and valid price before publication.");
+  const [inventory, meta, conditions, policies, location] = await Promise.all([
+    ebayRequest(accessToken,"GET",`${EBAY_INV_BASE}/inventory_item/${encodeURIComponent(sku)}`),
+    categoryAspects(categoryId,true), acceptedConditionIds(categoryId,accessToken,true), fetchAccountPolicyOptions(accessToken),
+    ebayRequest(accessToken,"GET",`${EBAY_INV_BASE}/location/${encodeURIComponent(String(current.json.merchantLocationKey || ""))}`),
+  ]);
+  if (!inventory.ok || !meta.length || !conditions.size || !location.ok || location.json?.merchantLocationStatus !== "ENABLED")
+    throw new Error("Could not verify this staged offer's inventory, category or shipping origin. Retry later.");
+  const product = inventory.json?.product;
+  if (typeof product?.title !== "string" || !product.title.trim() || product.title.length > 80 ||
+      typeof product.description !== "string" || !product.description.trim() ||
+      product.description !== current.json.listingDescription)
+    throw new Error("Review the staged title and description before publication.");
+  const urls = sanitizeEbayImageUrls(product.imageUrls);
+  if (!urls.length || urls.length !== product.imageUrls?.length)
+    throw new Error("The staged offer has missing or invalid photos. Review it before publication.");
+  if (![...conditions].some(id => CONDITION_ID_ENUM[id] === inventory.json?.condition))
+    throw new Error("Review the staged condition before publication.");
+  if (!product.aspects || typeof product.aspects !== "object" || Array.isArray(product.aspects) ||
+      Object.values(product.aspects).some(v => !Array.isArray(v) || v.some(x => typeof x !== "string")))
+    throw new Error("The staged item specifics could not be verified.");
+  const issues = validateAspects(product.aspects,meta);
+  if (issues.length) throw new Error(issues.join("; "));
+  const selected = current.json.listingPolicies;
+  if (!policies.fulfillmentPolicies.some(p => p.id === selected?.fulfillmentPolicyId) ||
+      !policies.paymentPolicies.some(p => p.id === selected?.paymentPolicyId) ||
+      !policies.returnPolicies.some(p => p.id === selected?.returnPolicyId))
+    throw new Error("A staged business policy is missing or unavailable. Review it before publication.");
+  let response: EbayResp | undefined;
+  try { response = await ebayRequest(accessToken,"POST",`${url}/publish`,{extraHeaders:CL}); } catch { /* reconcile */ }
+  if (response?.ok && response.json?.listingId)
+    return {success:true,sku,offerId,listingId:String(response.json.listingId)};
+  let verified: EbayResp | undefined;
+  try { verified = await ebayRequest(accessToken,"GET",url); } catch { /* report uncertainty */ }
+  if (verified?.ok && verified.json?.status === "PUBLISHED" && verified.json?.listing?.listingId)
+    return {success:true,sku,offerId,listingId:String(verified.json.listing.listingId)};
+  return {success:false,sku,offerId,error:response && response.status < 500 && verified?.ok
+    ? publishErrorMessage("Publish rejected; review the staged offer",response)
+    : "The publish outcome is unconfirmed. Your draft is saved. Retry to check eBay before posting again."};
+}
+
 // EBAY_STRICT_QUALITY=1 turns quality warnings into publish failures: better a
 // stopped listing than one that quietly published without searchable specifics.
 function strictQualityMode(): boolean {
-  return (
-    process.env.EBAY_STRICT_QUALITY === "1" ||
-    /^true$/i.test(process.env.EBAY_STRICT_QUALITY || "")
-  );
+  return process.env.EBAY_STRICT_QUALITY === "1" || /^true$/i.test(process.env.EBAY_STRICT_QUALITY || "");
 }
 
 const CL = { "Content-Language": "en-US" };
@@ -1013,19 +1063,20 @@ const CL = { "Content-Language": "en-US" };
 // LIVE listing's photos/title with the new item's — so we refuse instead.
 async function findPublishedOffer(
   accessToken: string,
-  sku: string,
+  sku: string
 ): Promise<{ offerId: string; listingId: string } | null> {
   const r = await ebayRequest(
     accessToken,
     "GET",
-    `${EBAY_INV_BASE}/offer?sku=${encodeURIComponent(sku)}&marketplace_id=${EBAY_MARKETPLACE_ID}`,
+    `${EBAY_INV_BASE}/offer?sku=${encodeURIComponent(sku)}&marketplace_id=${EBAY_MARKETPLACE_ID}`
   );
   if (!r.ok) {
     if (r.status === 404 || errorIds(r).includes(25713)) return null;
-    throw new Error(
-      "Could not verify whether this SKU is already live. Nothing was overwritten; retry later.",
-    );
+    throw new Error("Could not verify existing listings for this SKU. Retry before posting.");
   }
+  if (!Array.isArray(r.json?.offers)) throw new Error("eBay returned an unreadable offer state. Retry before posting.");
+  if (r.json.offers.some((o:any) => !o?.offerId || !["PUBLISHED","UNPUBLISHED"].includes(String(o.status))))
+    throw new Error("eBay returned an unconfirmed offer state. Retry before posting.");
   for (const o of r.json?.offers ?? []) {
     if (String(o?.status || "").toUpperCase() === "PUBLISHED") {
       return {
@@ -1037,273 +1088,172 @@ async function findPublishedOffer(
   return null;
 }
 
-// Upload photos with limited concurrency, preserving order. Sequential uploads
-// were the slowest part of a publish (12 photos ≈ up to a minute on their own)
-// and pushed long batches into Vercel's function timeout.
-// Exported for /api/ebay/upload-photos, which runs this over small client-side
-// batches so the publish request itself carries URLs instead of photo bytes.
+// Preserve only a confirmed, contiguous prefix so retries retain photo order.
+export class PhotoUploadError extends Error {
+  constructor(message: string, public urls: string[]) { super(message); }
+}
+
 export async function uploadPhotos(
   accessToken: string,
   images: { mediaType: string; data: string }[],
   sku: string,
-  // Photo numbering offset, so batched uploads name photos K72-O-1 … K72-O-12
-  // across batches instead of restarting at 1 in each.
-  nameOffset = 0,
+  nameOffset = 0
 ): Promise<string[]> {
-  const results: (string | null)[] = new Array(images.length).fill(null);
+  const results: (string | undefined)[] = new Array(images.length);
+  const failures: (Error | undefined)[] = new Array(images.length);
   let cursor = 0;
-  const workers = Array.from(
-    { length: Math.min(4, images.length) },
-    async () => {
-      while (cursor < images.length) {
-        const i = cursor++;
-        results[i] = await uploadPhoto(
-          accessToken,
-          images[i].data,
-          images[i].mediaType,
-          `${sku}-${nameOffset + i + 1}.jpg`,
-        );
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results.filter((u): u is string => Boolean(u));
+  await Promise.all(Array.from({ length: Math.min(4, images.length) }, async () => {
+    while (cursor < images.length) {
+      const i = cursor++;
+      try { results[i] = await uploadMediaImage(accessToken, images[i].data,
+        images[i].mediaType, `${sku}-${nameOffset + i + 1}.jpg`); }
+      catch (error) { failures[i] = error instanceof Error ? error : new Error("eBay photo upload failed."); }
+    }
+  }));
+  const firstFailure = failures.findIndex(Boolean);
+  if (firstFailure >= 0)
+    throw new PhotoUploadError(failures[firstFailure]!.message, results.slice(0, firstFailure) as string[]);
+  return results as string[];
 }
 
-export async function publishListing(
-  accessToken: string,
-  input: PublishInput,
-): Promise<PublishResult> {
-  const sku = skuSchema.parse(input.sku);
-  const listing = parseListing(input.listing);
-  const shipping = shippingSchema.parse(input.shipping);
-  const catId = listing.category_id || "";
-  if (
-    !input.review ||
-    input.review.categoryId !== catId ||
-    !verifyReview(catId, input.review.expiresAt, input.review.signature)
-  )
-    throw new Error("Prepare this category for review before publishing.");
-  const price = validListingPrice(listing.suggested_price);
-  if (!price || listing.title.length > 80 || !listing.description.trim())
-    throw new Error(
-      "A title of 1–80 characters, description and positive price are required.",
-    );
-  const photoUrls = sanitizeEbayImageUrls(input.imageUrls);
-  if (
-    !Number.isInteger(input.expectedPhotoCount) ||
-    !photoUrls.length ||
-    photoUrls.length !== input.expectedPhotoCount
-  )
-    throw new Error(
-      "Every selected photo must upload before publication. Retry the failed uploads.",
-    );
-  const [meta, accepted, options] = await Promise.all([
-    categoryAspects(catId),
-    acceptedConditionIds(catId, accessToken),
-    fetchAccountOptions(accessToken),
+const activeSkus = new Set<string>();
+
+export async function prepareListing(accessToken: string, raw: ListingResult, images: {mediaType:string;data:string}[] = []) {
+  const listing = cleanListingIdentifiers(raw);
+  const categories = await suggestLeafCategories(`${listing.category_hint || ""} ${listing.title || ""}`, 5);
+  const catId = listing.category_id || categories[0]?.id;
+  if (!catId || !/^\d+$/.test(catId)) throw new Error("eBay category suggestions are unavailable. Retry later.");
+  const [meta, accepted] = await Promise.all([
+    categoryAspects(catId, true), acceptedConditionIds(catId, accessToken, true),
   ]);
-  if (!meta.length || !accepted.size)
-    throw new Error(
-      "eBay category metadata is unavailable. Your draft is saved; retry later.",
-    );
-  const check = (rows: { id: string }[], id: string) =>
-    rows.some((r) => r.id === id);
-  if (
-    !check(options.fulfillment, shipping.fulfillmentPolicyId) ||
-    !check(options.payment, shipping.paymentPolicyId) ||
-    !check(options.locations, shipping.locationKey)
-  )
-    throw new Error(
-      "A selected shipping policy or location no longer exists. Select it again.",
-    );
-  if (!check(options.returns, shipping.returnPolicyId))
-    throw new Error(
-      "Choose an existing eBay return policy that accepts returns. Reload policies and select it again.",
-    );
-  const condition = listing.ebay_condition || "";
-  if (![...accepted].some((id) => CONDITION_ID_ENUM[id] === condition))
-    throw new Error("Select a condition supported by this category.");
-  const aspects = Object.fromEntries(
-    Object.entries(listing.item_specifics ?? {})
-      .filter(([, v]) => v.trim())
-      .map(([k, v]) => [k, v.split(" | ").map((x) => x.trim())]),
-  );
+  if (!meta.length || !accepted.size) throw new Error("eBay category requirements are unavailable. Retry later.");
+  const aspects = buildAspects(listing, String(listing.category || "other"));
+  canonicalizeAspectKeys(aspects, meta);
+  // Prepare formatting for review, without inventing missing facts.
+  for (const a of meta) {
+    if (a.mode === "SELECTION_ONLY" && aspects[a.name]) {
+      aspects[a.name] = aspects[a.name].map(v => matchAllowed(v, a.values) || v);
+    }
+  }
+  // Keep the existing provider-aware enrichment, but show its output to the
+  // seller before writes instead of adding facts inside publication.
+  if (images.length) await fillRecommendedAspects(listing,aspects,meta,"review",images);
+  enforceCardinality(aspects,meta);
+  for (const a of meta) if (a.required && !aspects[a.name]) aspects[a.name] = [];
+  const conditions = [...accepted].filter(id => CONDITION_ID_ENUM[id]).map(id => ({
+    value: CONDITION_ID_ENUM[id], label: CONDITION_ID_ENUM[id].replace(/_/g, " "),
+  }));
+  // Only the first semantic mapping is allowed: no stepping down to another grade.
+  const preferences = isApparelConditionPolicy(accepted) ? APPAREL_CONDITION_ID_PREFERENCES : GENERAL_CONDITION_ID_PREFERENCES;
+  const preferredId = preferences[normalizeConditionInput(listing.condition)]?.[0];
+  const proposed = listing.ebay_condition || (listing.condition && accepted.has(preferredId) ? CONDITION_ID_ENUM[preferredId] : "");
+  const prepared: ListingResult = { ...listing, category_id: catId,
+    category_name: categories.find(c => c.id === catId)?.path || listing.category_name || catId,
+    ebay_condition: proposed,
+    item_specifics: Object.fromEntries(Object.entries(aspects).map(([k,v]) => [k,v.join(" | ")])),
+  };
+  const issues = validateAspects(aspects, meta);
+  if (!conditions.some(c => c.value === proposed)) issues.push("Choose a condition supported by this category.");
+  const expiresAt = Date.now() + 23 * 60 * 60_000;
+  return { listing: prepared, review: { categoryId: catId, expiresAt, signature: signReview(catId, expiresAt) },
+    preparation: { categories, conditions, aspects: meta.map(a => ({ name:a.name,required:a.required,values:a.values,mode:a.mode })), issues } };
+}
+
+export async function publishListing(accessToken: string, setup: AccountSetup, input: PublishInput,
+  options: { publish?: boolean } = {}): Promise<PublishResult> {
+  validatePublishInput(input);
+  const activeKey = input.sku;
+  if (activeSkus.has(activeKey)) throw new Error("This SKU is already being saved. Wait for that attempt to finish.");
+  activeSkus.add(activeKey);
+  try {
+    return await withPublishOperation(input, options.publish !== false, () =>
+      withDeadline(240_000, () => publishReviewedListing(accessToken, setup, input, options.publish !== false)));
+  } finally { activeSkus.delete(activeKey); }
+}
+
+async function publishReviewedListing(accessToken: string, setup: AccountSetup, input: PublishInput,
+  shouldPublish: boolean): Promise<PublishResult> {
+  const { sku, listing } = input;
+  const catId = listing.category_id!;
+  if (!input.review || input.review.categoryId !== catId ||
+      !verifyReview(catId, input.review.expiresAt, input.review.signature)) {
+    throw new Error("Prepare this category for review before saving to eBay.");
+  }
+  const photoUrls = sanitizeEbayImageUrls(input.imageUrls);
+  if (photoUrls.length !== input.expectedPhotoCount || photoUrls.length !== input.imageUrls?.length)
+    throw new Error("Every selected photo must upload before saving to eBay. Retry the failed uploads.");
+  const [meta, accepted, policies] = await Promise.all([
+    categoryAspects(catId, true), acceptedConditionIds(catId, accessToken, true), fetchAccountPolicyOptions(accessToken),
+  ]);
+  if (!meta.length || !accepted.size) throw new Error("eBay category requirements are unavailable. Retry later.");
+  const condition = listing.ebay_condition;
+  if (![...accepted].some(id => CONDITION_ID_ENUM[id] === condition))
+    throw new Error("Choose a condition supported by this category.");
+  const aspects = Object.fromEntries(Object.entries(listing.item_specifics || {}).filter(([,v]) => v.trim())
+    .map(([k,v]) => [k, v.split(" | ").map(v => v.trim())]));
   const issues = validateAspects(aspects, meta);
   if (issues.length) throw new Error(issues.join("; "));
+  const selected = {
+    fulfillmentPolicyId: listing.fulfillment_policy_id || setup.fulfillmentPolicyId,
+    paymentPolicyId: listing.payment_policy_id || setup.paymentPolicyId,
+    returnPolicyId: listing.return_policy_id || setup.returnPolicyId,
+  };
+  if (!policies.fulfillmentPolicies.some(p => p.id === selected.fulfillmentPolicyId) ||
+      !policies.paymentPolicies.some(p => p.id === selected.paymentPolicyId) ||
+      !policies.returnPolicies.some(p => p.id === selected.returnPolicyId))
+    throw new Error("A selected business policy is missing or unavailable. Reload policies and select it again.");
+  if (!setup.locationKey) throw new Error("A verified shipping origin is required.");
   const existing = await findPublishedOffer(accessToken, sku);
-  if (existing)
-    return {
-      success: false,
-      sku,
-      alreadyListed: true,
-      ...existing,
-      error:
-        "This SKU is already live. Open the existing listing to confirm the previous attempt before posting again.",
-    };
-  const identifiers = extractProductIdentifiers(listing),
-    brand = realBrand(listing);
-  const inventoryItem = {
-    product: {
-      title: listing.title,
-      description: listing.description,
-      aspects,
-      imageUrls: photoUrls,
-      ...(identifiers.upc ? { upc: [identifiers.upc] } : {}),
-      ...(identifiers.ean ? { ean: [identifiers.ean] } : {}),
-      ...(identifiers.isbn ? { isbn: [identifiers.isbn] } : {}),
-      ...(identifiers.mpn && brand ? { brand, mpn: identifiers.mpn } : {}),
-    },
-    condition,
-    conditionDescription: listing.condition_notes || "",
-    availability: { shipToLocationAvailability: { quantity: 1 } },
-    ...(shipping.weightOz !== undefined || shipping.lengthIn !== undefined
-      ? {
-          packageWeightAndSize: {
-            ...(shipping.weightOz !== undefined
-              ? { weight: { value: shipping.weightOz, unit: "OUNCE" } }
-              : {}),
-            ...(shipping.lengthIn !== undefined
-              ? {
-                  dimensions: {
-                    length: shipping.lengthIn,
-                    width: shipping.widthIn,
-                    height: shipping.heightIn,
-                    unit: "INCH",
-                  },
-                }
-              : {}),
-            packageType: SAFE_PACKAGE_TYPE,
-          },
-        }
-      : {}),
-  };
-  const offerBody = {
-    sku,
-    marketplaceId: EBAY_MARKETPLACE_ID,
-    format: "FIXED_PRICE",
-    listingDescription: listing.description,
-    pricingSummary: {
-      price: { value: price.toFixed(2), currency: EBAY_CURRENCY },
-    },
-    quantityLimitPerBuyer: 1,
-    categoryId: catId,
-    merchantLocationKey: shipping.locationKey,
-    listingPolicies: {
-      fulfillmentPolicyId: shipping.fulfillmentPolicyId,
-      paymentPolicyId: shipping.paymentPolicyId,
-      returnPolicyId: shipping.returnPolicyId,
-    },
-    includeCatalogProductDetails: false,
-  };
-  const prior = await ebayRequest(
-    accessToken,
-    "GET",
-    EBAY_INV_BASE + "/inventory_item/" + encodeURIComponent(sku),
-  );
+  if (existing?.offerId === input.reconcileOfferId && existing?.listingId)
+    return {success:true,sku,...existing};
+  if (existing) return { success:false,sku,alreadyListed:true,...existing,
+    error:"This SKU is already live. Open the existing listing before posting again." };
+  const inventoryUrl = `${EBAY_INV_BASE}/inventory_item/${encodeURIComponent(sku)}`;
+  const prior = await ebayRequest(accessToken,"GET",inventoryUrl);
   if (!prior.ok && prior.status !== 404 && !errorIds(prior).includes(25713))
-    throw new Error("Could not verify the inventory SKU before writing.");
-  if (prior.ok) {
-    const p = prior.json;
-    // A retry may reuse exactly this item; a conflicting SKU must never be overwritten.
-    if (
-      p?.product?.title !== inventoryItem.product.title ||
-      p?.product?.description !== inventoryItem.product.description ||
-      JSON.stringify(p?.product?.imageUrls) !== JSON.stringify(photoUrls)
-    )
-      throw new Error(
-        "This SKU already contains a different draft. Choose a unique SKU before posting this item.",
-      );
-  }
-  const r = await withTransientRetry(
-    () =>
-      ebayRequest(
-        accessToken,
-        "PUT",
-        EBAY_INV_BASE + "/inventory_item/" + encodeURIComponent(sku),
-        { body: inventoryItem, extraHeaders: CL },
-      ),
-    "inventory item",
-    sku,
-  );
-  if (!r.ok)
-    return {
-      success: false,
-      sku,
-      error: publishErrorMessage(
-        "Inventory item rejected; review the draft",
-        r,
-      ),
-    };
-  // Reconcile existing unpublished offers before creating. Do not blindly retry POST.
-  const offers = await ebayRequest(
-    accessToken,
-    "GET",
-    EBAY_INV_BASE +
-      "/offer?sku=" +
-      encodeURIComponent(sku) +
-      "&marketplace_id=" +
-      EBAY_MARKETPLACE_ID,
-  );
-  if (!offers.ok && offers.status !== 404 && !errorIds(offers).includes(25713))
-    throw new Error(
-      "Could not confirm the existing offer state. Retry to reconcile before creating an offer.",
-    );
-  const previous = (offers.json?.offers ?? []).find(
-    (o: any) => o.status !== "PUBLISHED" && o.format === "FIXED_PRICE",
-  );
-  let offerId = previous?.offerId;
-  const offerResp = offerId
-    ? await ebayRequest(
-        accessToken,
-        "PUT",
-        EBAY_INV_BASE + "/offer/" + offerId,
-        { body: updateOfferBody(offerBody), extraHeaders: CL },
-      )
-    : await ebayRequest(accessToken, "POST", EBAY_INV_BASE + "/offer", {
-        body: offerBody,
-        extraHeaders: CL,
-      });
-  if (!offerResp.ok)
-    return {
-      success: false,
-      sku,
-      error: publishErrorMessage("Offer rejected; review the draft", offerResp),
-    };
-  offerId = offerId || offerResp.json?.offerId;
-  if (!offerId)
-    throw new Error(
-      "eBay did not return an offer ID. Retry to reconcile the saved draft.",
-    );
-  let published: EbayResp;
-  try {
-    published = await ebayRequest(
-      accessToken,
-      "POST",
-      EBAY_INV_BASE + "/offer/" + offerId + "/publish",
-      { extraHeaders: CL },
-    );
-  } catch (error) {
-    const live = await findPublishedOffer(accessToken, sku);
-    if (live) return { success: true, sku, ...live };
-    throw error;
-  }
-  if (published.ok && published.json?.listingId)
-    return {
-      success: true,
-      sku,
-      offerId,
-      listingId: String(published.json.listingId),
-    };
-  const live = await findPublishedOffer(accessToken, sku);
-  if (live) return { success: true, sku, ...live };
-  return {
-    success: false,
-    sku,
-    offerId,
-    error: publishErrorMessage(
-      "Publication rejected; the reviewed facts were preserved",
-      published,
-    ),
+    throw new Error("Could not verify the inventory SKU before writing. Retry later.");
+  if (prior.ok && (prior.json?.product?.title !== listing.title || prior.json?.product?.description !== listing.description ||
+      JSON.stringify(prior.json?.product?.imageUrls) !== JSON.stringify(photoUrls)) && !await ownsInventory(input,prior.json?.product))
+    throw new Error("This SKU contains a different draft. Use a unique SKU to preserve the existing item.");
+  const identifiers = extractProductIdentifiers(listing), brand = realBrand(listing);
+  const inventoryItem = {
+    product: { title:listing.title, description:listing.description, aspects,imageUrls:photoUrls,
+      ...(identifiers.upc ? {upc:[identifiers.upc]} : {}), ...(identifiers.ean ? {ean:[identifiers.ean]} : {}),
+      ...(identifiers.isbn ? {isbn:[identifiers.isbn]} : {}), ...(identifiers.mpn && brand ? {brand,mpn:identifiers.mpn} : {}) },
+    condition, conditionDescription:listing.condition_notes || "",
+    availability:{shipToLocationAvailability:{quantity:1}},
+    packageWeightAndSize:packageWeightAndSizeForListing(String(listing.category || "other"),listing),
   };
+  // Recheck state immediately before writes; never change reviewed facts to recover.
+  const offers = await ebayRequest(accessToken,"GET",`${EBAY_INV_BASE}/offer?sku=${encodeURIComponent(sku)}&marketplace_id=${EBAY_MARKETPLACE_ID}`);
+  if (!offers.ok && offers.status !== 404 && !errorIds(offers).includes(25713))
+    throw new Error("Could not confirm existing offers. Retry before creating one.");
+  if (offers.ok && !Array.isArray(offers.json?.offers)) throw new Error("eBay returned an unreadable offer state.");
+  const rows = offers.json?.offers || [];
+  if (rows.some((o:any) => !o?.offerId || !["PUBLISHED","UNPUBLISHED"].includes(String(o.status))))
+    throw new Error("eBay returned an unconfirmed offer state. Retry before writing.");
+  if (rows.some((o:any) => o.status === "PUBLISHED")) throw new Error("This SKU is already live. Reload before posting again.");
+  if (rows.length > 1) throw new Error("Multiple offers use this SKU. Resolve them in eBay before saving.");
+  if (rows.length && rows[0].format !== "FIXED_PRICE") throw new Error("This SKU has a different offer format. Use a unique SKU.");
+  const written = await withTransientRetry(() => ebayRequest(accessToken,"PUT",inventoryUrl,{body:inventoryItem,extraHeaders:CL}),"inventory item",sku);
+  if (!written.ok) return {success:false,sku,error:publishErrorMessage("Inventory rejected; review the listing",written)};
+  await recordInventory(input,inventoryItem.product);
+  const offerBody = { sku,marketplaceId:EBAY_MARKETPLACE_ID,format:"FIXED_PRICE",listingDescription:listing.description,
+    pricingSummary:{price:{value:validListingPrice(listing.suggested_price)!.toFixed(2),currency:EBAY_CURRENCY}},
+    quantityLimitPerBuyer:1,categoryId:catId,merchantLocationKey:setup.locationKey,listingPolicies:selected,
+    includeCatalogProductDetails:false };
+  let offerId = rows[0]?.offerId ? String(rows[0].offerId) : "";
+  // Non-idempotent create/publish calls are made once, then reconciled on eBay.
+  let offerResp: EbayResp;
+  try {
+    offerResp = offerId
+      ? await ebayRequest(accessToken,"PUT",`${EBAY_INV_BASE}/offer/${encodeURIComponent(offerId)}`,{body:updateOfferBody(offerBody),extraHeaders:CL})
+      : await ebayRequest(accessToken,"POST",`${EBAY_INV_BASE}/offer`,{body:offerBody,extraHeaders:CL});
+  } catch { throw new Error("The offer response was interrupted. Retry to check the saved offer before creating another."); }
+  if (!offerResp.ok) return {success:false,sku,offerId,error:publishErrorMessage("Offer rejected; review the listing",offerResp)};
+  offerId = offerId || String(offerResp.json?.offerId || "");
+  if (!offerId) throw new Error("eBay did not return an offer ID. Retry to reconcile the saved draft.");
+  if (!shouldPublish) return {success:true,sku,offerId,draft:true};
+  await recordPendingPublish(input,offerId);
+  return publishVerifiedStagedOffer(accessToken,offerId);
 }

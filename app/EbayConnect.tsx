@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { clearAccountOptions } from "@/lib/account-options-client";
 import { apiPost } from "@/lib/api-client";
 
 interface Status {
@@ -11,11 +10,8 @@ interface Status {
 
 export function EbayConnect() {
   const [status, setStatus] = useState<Status | null>(null);
-  const [notice, setNotice] = useState<{ ok: boolean; msg: string } | null>(
-    null,
-  );
+  const [notice, setNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [authorizeUrl, setAuthorizeUrl] = useState("");
   const [pasteValue, setPasteValue] = useState("");
 
   const refresh = useCallback(async () => {
@@ -32,15 +28,11 @@ export function EbayConnect() {
     // Surface the result of an OAuth round-trip (?ebay=connected|declined|error).
     const params = new URLSearchParams(window.location.search);
     const e = params.get("ebay");
-    if (e === "connected")
-      setNotice({ ok: true, msg: "eBay account connected!" });
+    if (e === "connected") setNotice({ ok: true, msg: "eBay account connected!" });
     else if (e === "declined")
       setNotice({ ok: false, msg: "eBay connection was declined." });
     else if (e === "error")
-      setNotice({
-        ok: false,
-        msg: params.get("msg") || "eBay connection failed.",
-      });
+      setNotice({ ok: false, msg: params.get("msg") || "eBay connection failed." });
     if (e) window.history.replaceState({}, "", window.location.pathname);
   }, [refresh]);
 
@@ -48,8 +40,6 @@ export function EbayConnect() {
     setBusy(true);
     try {
       await apiPost("/api/ebay/disconnect", {});
-      clearAccountOptions();
-      window.dispatchEvent(new Event("ebay-connection-changed"));
       await refresh();
       setNotice({ ok: true, msg: "Disconnected from eBay." });
     } finally {
@@ -62,14 +52,9 @@ export function EbayConnect() {
     setNotice(null);
     try {
       const r = await apiPost("/api/ebay/auth", {});
-      const data = (await r.json()) as {
-        ok: boolean;
-        url?: string;
-        error?: string;
-      };
-      if (!data.ok || !data.url)
-        throw new Error(data.error || "Couldn't start eBay authorization.");
-      setAuthorizeUrl(data.url);
+      const data = (await r.json()) as { ok: boolean; url?: string; error?: string };
+      if (!data.ok || !data.url) throw new Error(data.error || "Couldn't start eBay authorization.");
+      window.open(data.url, "_blank", "noopener,noreferrer");
     } catch (e) {
       setNotice({ ok: false, msg: (e as Error).message });
     } finally {
@@ -86,8 +71,6 @@ export function EbayConnect() {
       const data = (await r.json()) as { ok: boolean; error?: string };
       if (!data.ok) throw new Error(data.error || "Couldn't connect.");
       setPasteValue("");
-      clearAccountOptions();
-      window.dispatchEvent(new Event("ebay-connection-changed"));
       await refresh();
       setNotice({ ok: true, msg: "eBay account connected!" });
     } catch (e) {
@@ -129,11 +112,6 @@ export function EbayConnect() {
           >
             Open eBay ↗
           </button>
-          {authorizeUrl && (
-            <a href={authorizeUrl} target="_blank" rel="noopener noreferrer">
-              Continue to eBay ↗
-            </a>
-          )}
           <div className="ebay-paste">
             <label htmlFor="ebay-paste">
               <strong>Step 2:</strong> after you click <em>Agree</em>, copy the
