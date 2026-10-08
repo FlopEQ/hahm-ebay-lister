@@ -5,7 +5,7 @@ const isProd =
   process.env.NODE_ENV === "production" ||
   process.env.VERCEL_ENV === "production";
 
-export function proxy(request: NextRequest) {
+export function middleware(request: NextRequest) {
   // Fresh nonce for every HTML response. Buffer is polyfilled by Next.js for
   // the Edge runtime; crypto.randomUUID() is part of the Web Crypto API.
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
@@ -30,6 +30,7 @@ export function proxy(request: NextRequest) {
   // the inline <script> tags it generates during SSR (hydration, RSC payload).
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("x-nonce", nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
 
   const response = NextResponse.next({
     request: { headers: requestHeaders },

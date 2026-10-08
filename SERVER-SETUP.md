@@ -120,7 +120,8 @@ and the Windows Caddy executable are excluded. Your original project files are u
 
 Back up `.env` and the persistent data directory securely. Saved batches and operation receipts require
 writable persistent storage; this package does not add cloud background drafting or multi-server coordination.
-The code passed 331 automated tests, TypeScript checks, and a production build before packaging.
+The code passed 335 automated tests, TypeScript checks, and a production build before packaging.
+Production response headers and all rendered script nonces were also verified on a running copy.
 This release includes Anthropic SDK 0.132.1, Next.js 15.5.27, sharp 0.35.5,
 source-map-js 1.2.2, and Vitest 4.1.11. The dependency audit reported zero known
 vulnerabilities on October 8, 2026.
