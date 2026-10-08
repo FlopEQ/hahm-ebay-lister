@@ -5,6 +5,7 @@ const projectRoot = dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  allowedDevOrigins: ["ebay.nerdlab.pro"],
   // Pin the workspace root to this project (a stray lockfile elsewhere on the
   // machine would otherwise confuse Next's root detection).
   outputFileTracingRoot: projectRoot,
@@ -28,7 +29,7 @@ const nextConfig = {
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains" },
           { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
-          // Content-Security-Policy is set per-request by middleware.ts using a
+          // Content-Security-Policy is set per-request by proxy.ts using a
           // random nonce, so it cannot be a static header here.
         ],
       },

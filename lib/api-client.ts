@@ -1,14 +1,4 @@
 "use client";
-import { requestText } from "./text-dialog";
-
-let pendingCode: Promise<string | null> | null = null;
-function askForCode(message: string): Promise<string | null> {
-  if (!pendingCode)
-    pendingCode = requestText(message, true).finally(() => {
-      pendingCode = null;
-    });
-  return pendingCode;
-}
 
 /**
  * Client-side fetch wrapper for the AI API routes.
@@ -45,23 +35,8 @@ export function clearAccessCode(): void {
   }
 }
 
-async function accessRequired(res: Response): Promise<boolean> {
-  if (res.status !== 401) return false;
-  try {
-    return (await res.clone().json()).code === "ACCESS_CODE_REQUIRED";
-  } catch {
-    return false;
-  }
-}
-
-async function doFetch(
-  path: string,
-  body: unknown,
-  code: string | null,
-): Promise<Response> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
+async function doFetch(path: string, body: unknown, code: string | null): Promise<Response> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (code) headers["x-app-secret"] = code;
   return fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
 }
@@ -74,17 +49,22 @@ export async function apiPost(path: string, body: unknown): Promise<Response> {
   let code = storedCode();
   let res = await doFetch(path, body, code);
 
+  const needsCode = async (response: Response) => {
+    if (response.status !== 401) return false;
+    const data = await response.clone().json().catch(() => null);
+    return data?.code === "ACCESS_CODE_REQUIRED";
+  };
   // Up to two prompt attempts: covers both "no code yet" and "wrong code".
-  for (let attempt = 0; attempt < 2 && (await accessRequired(res)); attempt++) {
-    const entered = await askForCode(
+  for (let attempt = 0; attempt < 2 && await needsCode(res); attempt++) {
+    const entered = window.prompt(
       attempt === 0
-        ? "Enter your access code. This is the APP_SECRET you set in Vercel (Settings → Environment Variables) — not your Anthropic API key."
-        : "That didn't match the APP_SECRET set in Vercel — try again:",
+        ? "Enter your access code. This is the APP_SECRET you set in Vercel (Settings → Environment Variables) — not your AI API key."
+        : "That didn't match the APP_SECRET set in Vercel — try again:"
     );
     if (!entered || !entered.trim()) return res; // user cancelled — surface the 401
     code = entered.trim();
     res = await doFetch(path, body, code);
-    if (res.status !== 401) saveCode(code);
+    if (!await needsCode(res)) saveCode(code);
   }
   return res;
 }

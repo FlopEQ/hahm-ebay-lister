@@ -34,16 +34,16 @@ describe("chunkImagesForUpload", () => {
     expect(batches.map((b) => b.length)).toEqual([2, 1]);
   });
 
-  test("rejects oversize photos before creating an invalid upload request", () => {
+  test("ships an oversize single photo alone instead of dropping it", () => {
     const images = [img("a", MAX_BATCH_BASE64_CHARS + 10), img("b", 100)];
-    expect(() => chunkImagesForUpload(images)).toThrow(
-      "exceeds the upload size limit",
-    );
+    const batches = chunkImagesForUpload(images);
+    expect(batches.map((b) => b.length)).toEqual([1, 1]);
+    expect(batches[0][0].data.length).toBeGreaterThan(MAX_BATCH_BASE64_CHARS);
   });
 
   test("preserves photo order across batches", () => {
     const images = Array.from({ length: MAX_BATCH_PHOTOS * 2 + 1 }, (_, i) =>
-      img(`${i}`, 10),
+      img(`${i}`, 10)
     );
     const flattened = chunkImagesForUpload(images).flat();
     expect(flattened).toEqual(images);
@@ -51,11 +51,7 @@ describe("chunkImagesForUpload", () => {
 
   test("honors custom limits", () => {
     const images = [img("a", 5), img("b", 5), img("c", 5)];
-    expect(chunkImagesForUpload(images, 100, 2).map((b) => b.length)).toEqual([
-      2, 1,
-    ]);
-    expect(chunkImagesForUpload(images, 9, 4).map((b) => b.length)).toEqual([
-      1, 1, 1,
-    ]);
+    expect(chunkImagesForUpload(images, 100, 2).map((b) => b.length)).toEqual([2, 1]);
+    expect(chunkImagesForUpload(images, 9, 4).map((b) => b.length)).toEqual([1, 1, 1]);
   });
 });

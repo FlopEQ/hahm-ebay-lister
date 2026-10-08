@@ -1,12 +1,4 @@
-import {
-  ALWAYS_ESTIMATE,
-  acceptedPhotoFact,
-  isEstimate,
-  MIN_ESTIMATE_CONFIDENCE,
-  PHOTO_FACT_SCHEMA,
-} from "@/lib/photo-facts";
 import { remainingTime } from "@/lib/network";
-import { measuredMessage } from "@/lib/ai-usage";
 // Category-aware, photo-grounded item-specifics fill.
 //
 // The initial analysis model writes generic specifics without knowing which
@@ -22,64 +14,52 @@ import { measuredMessage } from "@/lib/ai-usage";
 //
 // Strictly best-effort: any failure leaves the aspects untouched.
 
+import type Anthropic from "@anthropic-ai/sdk";
+import { CLAUDE_ASPECT_MODEL } from "@/lib/claude-models";
+import { measuredMessage } from "@/lib/ai-meter";
+import type { ChatCompletionContentPart } from "openai/resources/chat/completions";
 import { getClient, parseModelJson } from "@/lib/anthropic";
-import { toImageBlock, urlImageBlock, type WireImage } from "@/lib/images";
+import { aiProvider } from "@/lib/aiProvider";
+import { OPENAI_ASPECT_MODEL, getOpenAIClient, openAIJson } from "@/lib/openai";
+import {
+  openAIUrlImagePart,
+  toImageBlock,
+  toOpenAIImagePart,
+  urlImageBlock,
+  type WireImage,
+} from "@/lib/images";
 import type { ListingResult } from "@/lib/types";
 import type { AspectMeta } from "./taxonomy";
-import {
-  cleanAspectValue,
-  matchAllowed,
-  splitAspectValues,
-  MAX_MULTI_VALUES,
-} from "./aspects";
+import { cleanAspectValue, matchAllowed, splitAspectValues, MAX_MULTI_VALUES } from "./aspects";
 
-const FILL_MODEL = "claude-sonnet-4-6";
+const FILL_MODEL = CLAUDE_ASPECT_MODEL;
 // Prompt-size bound, applied AFTER priority sorting — a category with 60
 // aspects fills its required + recommended ones first, never junk-first.
 const MAX_ASPECTS_TO_FILL = 40;
 const MAX_ALLOWED_VALUES_SHOWN = 40;
 // Vision costs scale with image count; 8 photos cover tags + details for
 // nearly every item while keeping the call cheap (~1–3¢).
-const MAX_FILL_IMAGES = 24;
+const MAX_FILL_IMAGES = 8;
 
 const USAGE_RANK = { REQUIRED: 0, RECOMMENDED: 1, OPTIONAL: 2 } as const;
 
 export function prioritizeAspects(unfilled: AspectMeta[]): AspectMeta[] {
   return [...unfilled].sort(
-    (a, b) => (USAGE_RANK[a.usage] ?? 2) - (USAGE_RANK[b.usage] ?? 2),
+    (a, b) => (USAGE_RANK[a.usage] ?? 2) - (USAGE_RANK[b.usage] ?? 2)
   );
 }
 
 function aspectPromptLine(a: AspectMeta): string {
-  const tag =
-    a.usage === "REQUIRED"
-      ? " [required]"
-      : a.usage === "RECOMMENDED"
-        ? " [recommended]"
-        : "";
-  const multi =
-    a.cardinality === "MULTI"
-      ? " (multiple values allowed — return an array)"
-      : "";
+  const tag = a.usage === "REQUIRED" ? " [required]" : a.usage === "RECOMMENDED" ? " [recommended]" : "";
+  const multi = a.cardinality === "MULTI" ? " (multiple values allowed — return an array)" : "";
   if (a.mode === "SELECTION_ONLY" && a.values.length) {
-    const values =
-      a.values.length <= MAX_ALLOWED_VALUES_SHOWN
-        ? a.values.join(" | ")
-        : "(large list: return only the exact value visible in the evidence; it will be validated)";
+    const values = a.values.slice(0, MAX_ALLOWED_VALUES_SHOWN).join(" | ");
     return `- "${a.name}"${tag}${multi} (must be EXACTLY one of: ${values})`;
   }
   const hint = a.values.length
     ? ` (common values: ${a.values.slice(0, 12).join(" | ")})`
     : "";
   return `- "${a.name}"${tag} (free text)${multi}${hint}`;
-}
-
-export function alwaysEstimatePromptLine(names: string[]): string {
-  const wanted = new Set(names.map((n) => n.toLowerCase()));
-  const always = ALWAYS_ESTIMATE.filter((n) => wanted.has(n.toLowerCase()));
-  return always.length
-    ? `- Always return your single best guess for ${always.map((n) => `"${n}"`).join(", ")}, even below ${MIN_ESTIMATE_CONFIDENCE}; report your true confidence.`
-    : "";
 }
 
 export async function fillRecommendedAspects(
@@ -91,16 +71,16 @@ export async function fillRecommendedAspects(
   // When the client pre-uploaded photos to eBay (batched to dodge Vercel's
   // body limit), the publish request has no base64 in hand — the vision pass
   // reads the eBay-hosted URLs instead, so photo grounding survives.
-  imageUrls: string[] = [],
+  imageUrls: string[] = []
 ): Promise<void> {
   const have = new Set(Object.keys(aspects).map((k) => k.toLowerCase()));
   const candidates = prioritizeAspects(
-    meta.filter((a) => a.name && !have.has(a.name.toLowerCase())),
+    meta.filter((a) => a.name && !have.has(a.name.toLowerCase()))
   );
   const unfilled = candidates.slice(0, MAX_ASPECTS_TO_FILL);
   if (candidates.length > unfilled.length) {
     console.log(
-      `[ebay/publish] aspect-fill sku=${sku}: ${candidates.length - unfilled.length} low-priority aspects skipped (cap ${MAX_ASPECTS_TO_FILL})`,
+      `[ebay/publish] aspect-fill sku=${sku}: ${candidates.length - unfilled.length} low-priority aspects skipped (cap ${MAX_ASPECTS_TO_FILL})`
     );
   }
   if (unfilled.length === 0) return;
@@ -119,27 +99,30 @@ export async function fillRecommendedAspects(
     size: clip(listing.size, 40),
     material: clip(listing.material, 80),
     measurements: clip(listing.measurements, 200),
-    key_features: (listing.key_features ?? [])
-      .slice(0, 5)
-      .map((f) => clip(f, 100)),
+    key_features: (listing.key_features ?? []).slice(0, 5).map((f) => clip(f, 100)),
     item_specifics: Object.fromEntries(
       Object.entries(listing.item_specifics ?? {})
         .slice(0, 40)
-        .map(([k, v]) => [clip(k, 60), clip(v, 120)]),
+        .map(([k, v]) => [clip(k, 60), clip(v, 120)])
     ),
     description: clip(listing.description, 900),
   };
 
+  const provider = aiProvider();
   const imageBlocks = (
     images.length
       ? images.slice(0, MAX_FILL_IMAGES).map(toImageBlock)
       : imageUrls.slice(0, MAX_FILL_IMAGES).map(urlImageBlock)
-  ).filter((b): b is NonNullable<ReturnType<typeof toImageBlock>> =>
-    Boolean(b),
-  );
+  ).filter((b): b is NonNullable<ReturnType<typeof toImageBlock>> => Boolean(b));
+  const openAIImageParts = (
+    images.length
+      ? images.slice(0, MAX_FILL_IMAGES).map((img) => toOpenAIImagePart(img, "high"))
+      : imageUrls.slice(0, MAX_FILL_IMAGES).map((url) => openAIUrlImagePart(url, "high"))
+  ).filter((b): b is ChatCompletionContentPart => Boolean(b));
+  const activeImageCount = provider === "openai" ? openAIImageParts.length : imageBlocks.length;
 
   const prompt = `You are completing eBay item specifics for a draft awaiting seller review.
-${imageBlocks.length ? "The photos above show the actual item. Inspect every photo again — tags, labels, stamps, close-ups — for evidence." : ""}
+${activeImageCount ? "The photos above show the actual item. Inspect every photo again — tags, labels, stamps, close-ups — for evidence." : ""}
 ITEM DATA (from earlier photo analysis):
 ${JSON.stringify(itemData, null, 1)}
 
@@ -147,64 +130,50 @@ EBAY WANTS VALUES FOR THESE ASPECTS (exact aspect names for this category):
 ${unfilled.map(aspectPromptLine).join("\n")}
 
 Rules:
-- Fill every aspect you can determine or reasonably estimate from the photos and item data. Educated guesses are welcome: judge materials, construction, style, width, closure, theme, etc. from what the item looks like, the brand, and the model.
-- Give each fact a confidence from 0 to 100 that the value is correct. Omit any aspect below ${MIN_ESTIMATE_CONFIDENCE}; it is better blank than wrong.
-${alwaysEstimatePromptLine(unfilled.map((a) => a.name))}
+- Fill ONLY aspects supported by visible evidence in the photos or by the item data. Omit everything else — never guess.
 - Use ONLY the supplied eBay aspect names as keys, spelled exactly as given.
 - For "must be EXACTLY one of" aspects, copy the value verbatim from the list.
 - For "multiple values allowed" aspects you may return a JSON array of values.
 - Never answer with placeholder text like "See photos", "Unknown", or "N/A" — omit the aspect instead.
 - Values must be short (under 65 characters each).
 
-Label-only (never estimate): UPC/EAN/ISBN/MPN, year of manufacture, country/region of manufacture, vintage, handmade, personalization and any tape measurement. Sizes come from a readable size label; a size estimated from appearance is below ${MIN_ESTIMATE_CONFIDENCE}. A legal eBay value is not evidence by itself. Copyright dates are not manufacture dates.
-Return {"facts":[{"name":"Material","value":"Cashmere","basis":"label","quote":"100% CASHMERE","photoIndices":[2],"confidence":98},{"name":"Upper Material","value":"Leather","basis":"estimate","quote":"","photoIndices":[1],"confidence":80}]}. basis: label for text read off a tag or label (quote it exactly); visible_feature for something plainly visible; estimate for an educated guess. Use an empty quote for visible_feature and estimate. Photo indices are 1-based. Return {"facts":[]} if nothing reaches ${MIN_ESTIMATE_CONFIDENCE}`;
+Return ONLY valid JSON mapping aspect name to value (string, or array for multi-value aspects), e.g. {"Sleeve Length": "Long Sleeve", "Material": ["Cotton", "Polyester"]}. Return {} if nothing can be determined. No markdown, no explanation.`;
 
   try {
-    const client = getClient();
-    const resp = await measuredMessage(
-      "specifics",
-      client,
-      {
+    let filled: Record<string, unknown>;
+    if (provider === "openai") {
+      filled = await openAIJson<Record<string, unknown>>({
+        client: getOpenAIClient(),
+        model: OPENAI_ASPECT_MODEL,
+        maxTokens: 1500,
+        timeout:remainingTime(60_000),
+        maxRetries:0,
+        content: [...openAIImageParts, { type: "text", text: prompt }],
+      });
+    } else {
+      const client = getClient();
+      const resp = await measuredMessage("specifics", client as Anthropic, {
         model: FILL_MODEL,
-        max_tokens: 2200,
-        output_config: {
-          format: {
-            type: "json_schema",
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                facts: { type: "array", items: PHOTO_FACT_SCHEMA },
-              },
-              required: ["facts"],
-            },
-          },
-        },
+        max_tokens: 1500,
         messages: [
           {
             role: "user",
             content: [...imageBlocks, { type: "text", text: prompt }],
           },
         ],
-      },
-      { timeout: remainingTime(60_000), maxRetries: 0 },
-    );
-    const block = resp.content.find((b) => b.type === "text");
-    const text = block && block.type === "text" ? block.text : "";
-    const filled = parseModelJson<{ facts?: unknown[] }>(text);
+      },{timeout:remainingTime(60_000),maxRetries:0});
+      const block = resp.content.find((b) => b.type === "text");
+      const text = block && block.type === "text" ? block.text : "";
+      filled = parseModelJson<Record<string, unknown>>(text);
+    }
 
     const byLower = new Map(unfilled.map((a) => [a.name.toLowerCase(), a]));
     let added = 0;
-    for (const fact of filled.facts ?? []) {
-      if (!acceptedPhotoFact(fact, imageBlocks.length)) continue;
-      const key = fact.name,
-        raw = fact.value;
+    for (const [key, raw] of Object.entries(filled || {})) {
       const a = byLower.get(String(key).toLowerCase());
       if (!a || aspects[a.name]) continue;
       const parts = Array.isArray(raw)
-        ? raw
-            .map((v) => cleanAspectValue(String(v ?? ""), a.maxLength))
-            .filter(Boolean)
+        ? raw.map((v) => cleanAspectValue(String(v ?? ""), a.maxLength)).filter(Boolean)
         : splitAspectValues(raw, a.maxLength);
       if (!parts.length) continue;
       let vals: string[];
@@ -229,28 +198,16 @@ Return {"facts":[{"name":"Material","value":"Cashmere","basis":"label","quote":"
         vals = parts;
       }
       aspects[a.name] =
-        a.cardinality === "MULTI"
-          ? vals.slice(0, MAX_MULTI_VALUES)
-          : vals.slice(0, 1);
-      listing.evidence = { ...listing.evidence, [a.name]: fact.photoIndices };
-      if (isEstimate(fact))
-        listing.estimates = {
-          ...listing.estimates,
-          [a.name]: fact.confidence ?? 0,
-        };
+        a.cardinality === "MULTI" ? vals.slice(0, MAX_MULTI_VALUES) : vals.slice(0, 1);
       added++;
     }
     if (added) {
       console.log(
         `[ebay/publish] aspect-fill added ${added} specifics sku=${sku}` +
-          (imageBlocks.length
-            ? ` (vision, ${imageBlocks.length} photos)`
-            : " (text-only)"),
+          (activeImageCount ? ` (vision, ${activeImageCount} photos)` : " (text-only)")
       );
     }
   } catch (e) {
-    console.warn(
-      `[ebay/publish] aspect-fill skipped sku=${sku}: ${(e as Error).message}`,
-    );
+    console.warn(`[ebay/publish] aspect-fill skipped sku=${sku}: ${(e as Error).message}`);
   }
 }

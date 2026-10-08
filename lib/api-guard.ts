@@ -4,7 +4,7 @@ import crypto from "crypto";
 /**
  * Access guard for the AI-powered API routes.
  *
- * These routes spend real money (Anthropic API calls) on every request, so a
+ * These routes spend real money (AI API calls) on every request, so a
  * public deployment must not leave them open. Set APP_SECRET in your
  * environment and the app will ask for the access code once per device
  * (it's remembered in the browser afterwards).
@@ -39,25 +39,28 @@ function clientIp(req: NextRequest): string {
   );
 }
 
-function rateLimited(ip: string, limit = RATE_LIMIT_MAX_REQUESTS): boolean {
+interface RateOptions { bucket: string; maxRequests: number }
+
+function rateLimited(ip: string, maxRequests = RATE_LIMIT_MAX_REQUESTS): boolean {
   const now = Date.now();
   const windowStart = now - RATE_LIMIT_WINDOW_MS;
   const recent = (hits.get(ip) ?? []).filter((t) => t > windowStart);
   recent.push(now);
   hits.set(ip, recent);
   if (hits.size > 5000) hits.clear(); // bound memory under address-spray
-  return recent.length > limit;
+  return recent.length > maxRequests;
 }
 
 /**
  * Rate limiting only — for routes that must stay reachable without the access
  * code (the eBay OAuth callback, the status probe) but shouldn't be hammered.
  */
-export function rateLimitRequest(req: NextRequest): NextResponse | null {
-  if (rateLimited(clientIp(req))) {
+export function rateLimitRequest(req: NextRequest, options?: RateOptions): NextResponse | null {
+  const key = options ? `${options.bucket}:${clientIp(req)}` : clientIp(req);
+  if (rateLimited(key, options?.maxRequests)) {
     return NextResponse.json(
       { ok: false, error: "Too many requests — wait a minute and try again." },
-      { status: 429 },
+      { status: 429 }
     );
   }
   return null;
@@ -66,61 +69,45 @@ export function rateLimitRequest(req: NextRequest): NextResponse | null {
 /**
  * Returns an error response when the request isn't allowed, or null to proceed.
  */
-export function guardApiRequest(req: NextRequest): NextResponse | null {
-  const authenticated = Boolean(
-    process.env.APP_SECRET &&
-    timingSafeEqual(
-      req.headers.get("x-app-secret") ?? "",
-      process.env.APP_SECRET,
-    ),
-  );
-  if (
-    authenticated ? rateLimited(clientIp(req), 600) : rateLimited(clientIp(req))
-  )
-    return NextResponse.json(
-      { ok: false, error: "Too many requests — wait a minute and try again." },
-      { status: 429 },
-    );
+export function guardApiRequest(req: NextRequest, options?: RateOptions): NextResponse | null {
+  // A higher-volume local-photo bucket is available only after authentication.
+  const limited = options ? null : rateLimitRequest(req);
+  if (limited) return limited;
 
   const secret = process.env.APP_SECRET;
   if (!secret) {
     // Fail closed in production — never run a deployed app without an access code.
-    if (
-      process.env.NODE_ENV === "production" ||
-      process.env.VERCEL_ENV === "production"
-    ) {
+    if (process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production") {
       return NextResponse.json(
         {
           ok: false,
           error:
             "This deployment has no APP_SECRET configured. Set it in Vercel → Settings → Environment Variables, then redeploy.",
         },
-        { status: 503 },
+        { status: 503 }
       );
     }
-    return null; // local development only
+    return options ? rateLimitRequest(req, options) : null; // local development only
   }
 
   const provided = req.headers.get("x-app-secret") ?? "";
   if (!provided || !timingSafeEqual(provided, secret)) {
+    const deniedLimit = options ? rateLimitRequest(req) : null;
+    if (deniedLimit) return deniedLimit;
     return NextResponse.json(
-      {
-        ok: false,
-        code: "ACCESS_CODE_REQUIRED",
-        error: "Access code required.",
-      },
-      { status: 401 },
+      { ok: false, code: "ACCESS_CODE_REQUIRED", error: "Access code required." },
+      { status: 401 }
     );
   }
 
-  return null;
+  return options ? rateLimitRequest(req, options) : null;
 }
 
 /** Log the real error server-side; return only a safe message to the client. */
 export function safeErrorResponse(
   context: string,
   e: unknown,
-  fallback: string,
+  fallback: string
 ): NextResponse {
   console.error(`[${context}]`, e);
   return NextResponse.json({ ok: false, error: fallback }, { status: 500 });

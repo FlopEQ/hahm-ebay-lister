@@ -33,8 +33,8 @@ export default function PrivacyPage() {
         <h2 className="section-label">What we share</h2>
         <ul>
           <li>
-            Photos and listing text are sent to <strong>Anthropic</strong> (the
-            AI that writes the listing) and, when you choose to post, to{" "}
+            Photos and listing text are sent to your configured{" "}
+            <strong>AI provider</strong> and, when you choose to post, to{" "}
             <strong>eBay</strong> to create your listing.
           </li>
           <li>

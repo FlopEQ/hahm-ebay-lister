@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { buildCompQuery, compStats, filterComps } from "@/lib/ebay/comps";
+import { buildCompQuery, buildCompSearch, compStats, filterComps } from "@/lib/ebay/comps";
 import type { ListingResult } from "@/lib/types";
 
 const listing = (over: Partial<ListingResult>): ListingResult => ({
@@ -9,6 +9,53 @@ const listing = (over: Partial<ListingResult>): ListingResult => ({
 });
 
 describe("buildCompQuery", () => {
+  test("prefers a valid UPC over fuzzy brand and type", () => {
+    const result = buildCompSearch(
+      listing({
+        brand: "Some Brand",
+        item_type: "Widget",
+        item_specifics: { UPC: "810017647248" },
+      })
+    );
+    expect(result).toEqual({
+      query: "810017647248",
+      source: "identifier",
+      identifierType: "UPC",
+      param: "gtin",
+    });
+    expect(buildCompQuery(listing({ item_specifics: { UPC: "810017647248" } }))).toBe(
+      "810017647248"
+    );
+  });
+
+  test("prefers a valid ISBN before fuzzy title search", () => {
+    const result = buildCompSearch(
+      listing({
+        brand: "No Brand",
+        item_type: "Book",
+        item_specifics: { ISBN: "978-0-306-40615-7" },
+      })
+    );
+    expect(result).toEqual({
+      query: "9780306406157",
+      source: "identifier",
+      identifierType: "ISBN",
+      param: "q",
+    });
+  });
+
+  test("ignores invalid identifier values", () => {
+    expect(
+      buildCompQuery(
+        listing({
+          brand: "Ralph Lauren",
+          item_type: "Cable Knit Sweater",
+          item_specifics: { UPC: "12345" },
+        })
+      )
+    ).toBe("Ralph Lauren Cable Knit Sweater");
+  });
+
   test("prefers brand + item type", () => {
     expect(
       buildCompQuery(listing({ brand: "Ralph Lauren", item_type: "Cable Knit Sweater" }))

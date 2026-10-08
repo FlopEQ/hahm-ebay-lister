@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getClient, AnthropicAuthError } from "@/lib/anthropic";
+import { AnthropicAuthError } from "@/lib/anthropic";
+import { aiProvider, getAiClient } from "@/lib/aiProvider";
+import { OpenAIAuthError } from "@/lib/openai";
 import { guardApiRequest, safeErrorResponse } from "@/lib/api-guard";
 import { checkMergePair } from "@/lib/sortPipeline";
-import { isAllowedModel } from "@/lib/models";
+import { isAllowedProviderModel } from "@/lib/models";
 import type { WireImage } from "@/lib/images";
+import { withAiUsageResponse, AiConfigurationError } from "@/lib/ai-meter";
 
 // Merge check across sort-chunk boundaries: big batches are sorted 100 photos
 // per request, so an item photographed across a boundary is split into two
@@ -11,7 +14,7 @@ import type { WireImage } from "@/lib/images";
 
 export const maxDuration = 30;
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   const denied = guardApiRequest(req);
   if (denied) return denied;
 
@@ -25,23 +28,34 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Missing photos." }, { status: 400 });
   }
 
+  const provider = aiProvider();
   const requested = typeof body.sortModel === "string" ? body.sortModel.trim() : "";
-  const model = isAllowedModel(requested) ? requested : undefined;
+  const model = isAllowedProviderModel(requested, provider) ? requested : undefined;
 
   try {
     const merge = await checkMergePair(
-      getClient(),
+      getAiClient(provider),
       body.a,
       body.b,
       Math.max(1, Number(body.countA) || 1),
       Math.max(1, Number(body.countB) || 1),
-      model
+      model,
+      provider
     );
     return NextResponse.json({ ok: true, merge });
   } catch (e) {
+    if (e instanceof AiConfigurationError)
+      return NextResponse.json({ ok: false, error: e.message }, { status: e.status });
     if (e instanceof AnthropicAuthError) {
+      return NextResponse.json({ ok: false, error: e.message }, { status: e.status });
+    }
+    if (e instanceof OpenAIAuthError) {
       return NextResponse.json({ ok: false, error: e.message }, { status: e.status });
     }
     return safeErrorResponse("merge-check", e, "Merge check failed.");
   }
+}
+
+export async function POST(req: NextRequest) {
+  return withAiUsageResponse(() => handlePOST(req));
 }
