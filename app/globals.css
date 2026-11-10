@@ -1451,3 +1451,9 @@ textarea {
 .model-hint {
   font-style: italic;
 }
+
+.specifics-missing-summary { line-height: 1.6; }
+.missing-required { color: #b42318; font-weight: 600; }
+.missing-recommended { color: #854d0e; }
+.specific-missing-required input { border-color: #b42318; }
+.specific-missing-recommended input { border-color: #a16207; }

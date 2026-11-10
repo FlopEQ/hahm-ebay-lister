@@ -64,6 +64,22 @@ function element(html: string, tag: string, id: string): string {
 }
 
 describe("prepared listing review", () => {
+  it("surfaces absent metadata fields and prioritizes missing specifics without changing condition", () => {
+    const group = preparedGroup();
+    group.listing!.item_specifics = { Brand: "Publisher" };
+    group.ebayPreparation!.aspects.push({ name: "Language", required: false,
+      usage: "RECOMMENDED", values: ["English"], mode: "FREE_TEXT" });
+    const html = render(group);
+    expect(html).toContain("Required, still empty: Author.");
+    expect(html).toContain("Recommended, still empty: Language.");
+    expect(html.indexOf('aria-label="Author value"')).toBeLessThan(html.indexOf('aria-label="Language value"'));
+    expect(html.indexOf('aria-label="Language value"')).toBeLessThan(html.indexOf('aria-label="Brand value"'));
+    expect(html).toMatch(/aria-label="Author value"[^>]*aria-invalid="true"/);
+    expect(group.listing!.item_specifics).toEqual({ Brand: "Publisher" });
+    expect(group.listing!.ebay_condition).toBe("USED_GOOD");
+    group.listing!.item_specifics = { Author: "Ada", Language: "English", Brand: "Publisher" };
+    expect(render(group)).not.toContain("still empty:");
+  });
   it("shows the accumulated item AI cost", () => {
     const group = preparedGroup();
     group.analysisUsage = { calls: 2, inputTokens: 100, outputTokens: 20, cacheReadTokens: 0,

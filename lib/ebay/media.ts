@@ -31,6 +31,23 @@ function failure(status: number): Error {
   return new Error(`eBay photo upload failed (HTTP ${status}). The unfinished photo was not confirmed.`);
 }
 
+// Only surface bounded structured eBay messages, never raw response bodies.
+async function mediaFailure(response: Response, accessToken: string): Promise<Error> {
+  const fallback = failure(response.status).message;
+  try {
+    const body = await response.json();
+    const error = Array.isArray(body?.errors) ? body.errors[0] : undefined;
+    const raw = typeof error?.longMessage === "string" && error.longMessage.trim()
+      ? error.longMessage : error?.message;
+    if (typeof raw !== "string" || !raw.trim()) return new Error(fallback);
+    const reason = raw.split(accessToken).join("[redacted]")
+      .replace(/Bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+      .replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 400);
+    const id = Number.isSafeInteger(error?.errorId) ? ` ${error.errorId}` : "";
+    return new Error(`${fallback} eBay error${id}: ${reason}`);
+  } catch { return new Error(fallback); }
+}
+
 async function readImage(response: Response): Promise<string | null> {
   try { return imageUrl((await response.json())?.imageUrl); }
   catch { return null; }
@@ -50,13 +67,13 @@ export async function uploadMediaImage(accessToken: string, data: string, mediaT
   const response = await request(`${MEDIA_BASE}/image/create_image_from_file`, {
     method: "POST", headers, body: form, redirect: "error",
   });
-  if (response.status !== 201) throw failure(response.status);
+  if (response.status !== 201) throw await mediaFailure(response, accessToken);
   const result = await readImage(response);
   if (result) return result;
   const resource = resourceUrl(response.headers.get("location"));
   if (resource) {
     const recovered = await request(resource, { method: "GET", headers, redirect: "error" });
-    if (!recovered.ok) throw failure(recovered.status);
+    if (!recovered.ok) throw await mediaFailure(recovered, accessToken);
     const recoveredUrl = await readImage(recovered);
     if (recoveredUrl) return recoveredUrl;
   }

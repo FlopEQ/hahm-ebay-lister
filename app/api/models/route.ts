@@ -6,7 +6,7 @@ import {
   OPENAI_ROUTER_MODEL,
   OPENAI_SORT_MODEL,
 } from "@/lib/openai";
-import { isAllowedModel } from "@/lib/models";
+import { allowedProviderModels, isAllowedProviderModel } from "@/lib/models";
 import type { ModelInfo } from "@anthropic-ai/sdk/resources/models.js";
 import { CLAUDE_ANALYSIS_MODEL, CLAUDE_SORT_MODEL } from "@/lib/claude-models";
 
@@ -123,7 +123,7 @@ function buildPayload(raw: ModelInfo[]): ModelsPayload {
   // Only offer models the call routes will actually accept (lib/models.ts) — this
   // keeps the premium "fable" tier out of the selector so the UI never shows a
   // model the server would reject.
-  const vision = raw.filter((m) => isAllowedModel(m.id));
+  const vision = raw.filter((m) => isAllowedProviderModel(m.id, "anthropic"));
   if (vision.length === 0) return FALLBACK;
 
   const sortModels = vision.map((m) => ({
@@ -142,14 +142,27 @@ function buildPayload(raw: ModelInfo[]): ModelsPayload {
   return { sortModels, analysisModels };
 }
 
+function permittedPayload(payload: ModelsPayload, provider: "anthropic" | "openai"): ModelsPayload {
+  const options = (models: ModelOption[]) => {
+    const permitted = models.filter(m => isAllowedProviderModel(m.id, provider));
+    for (const id of provider === "openai" ? allowedProviderModels(provider) : []) {
+      if (!permitted.some(m => m.id === id)) permitted.push({ id,
+        displayName: provider === "openai" ? displayOpenAIModel(id) : id,
+        description: "Server-approved model.", isDefault: false });
+    }
+    return permitted;
+  };
+  return { sortModels: options(payload.sortModels), analysisModels: options(payload.analysisModels) };
+}
+
 export async function GET() {
   if (aiProvider() === "openai") {
-    return NextResponse.json(OPENAI_FALLBACK);
+    return NextResponse.json(permittedPayload(OPENAI_FALLBACK, "openai"));
   }
 
   const now = Date.now();
   if (cache && now - cacheAt < CACHE_TTL) {
-    return NextResponse.json(cache);
+    return NextResponse.json(permittedPayload(cache, "anthropic"));
   }
 
   try {
@@ -161,8 +174,8 @@ export async function GET() {
     }
     cache = buildPayload(models);
     cacheAt = now;
-    return NextResponse.json(cache);
+    return NextResponse.json(permittedPayload(cache, "anthropic"));
   } catch {
-    return NextResponse.json(FALLBACK);
+    return NextResponse.json(permittedPayload(FALLBACK, "anthropic"));
   }
 }

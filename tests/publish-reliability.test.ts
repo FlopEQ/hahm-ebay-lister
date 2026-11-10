@@ -77,6 +77,7 @@ describe("listing preparation", () => {
     const result = await prepareListing("token", { title: "Reviewed item", description: "Seller description", category_id: "267", ebay_condition: "USED_GOOD" });
     expect(result.listing.item_specifics?.Material).toBe("");
     expect(result.preparation.issues).toContain("Enter Material");
+    expect(result.preparation.aspects[0].usage).toBe("REQUIRED");
     expect(requests).toHaveLength(0);
   });
   it("honors the seller's explicit category when suggestions differ", async () => {

@@ -194,7 +194,7 @@ export interface ItemGroup {
   ebayPreparation?: {
     categories: { id: string; name: string; path?: string }[];
     conditions: { value: string; label: string }[];
-    aspects: { name: string; required: boolean; values: string[]; mode: string }[];
+    aspects: { name: string; required: boolean; usage?: "REQUIRED" | "RECOMMENDED" | "OPTIONAL"; values: string[]; mode: string }[];
     issues: string[];
   };
   ebayUpload?: { fingerprint: string; urls: string[] };

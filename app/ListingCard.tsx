@@ -111,9 +111,23 @@ export function ListingCard({
   const hiddenPhotoIds = new Set(group.hiddenPhotoIds ?? []);
 
   const specifics = useMemo(() => {
-    const entries = Object.entries(listing?.item_specifics ?? {});
-    return entries.filter(([k]) => !k.startsWith("---"));
-  }, [listing?.item_specifics]);
+    const values = listing?.item_specifics ?? {};
+    const meta = group.ebayPreparation?.aspects ?? [];
+    const names = [...new Set([...Object.keys(values),
+      ...meta.filter(a => a.required || a.usage === "RECOMMENDED").map(a => a.name)])];
+    const rank = (name: string) => {
+      if ((values[name] ?? "").trim()) return 2;
+      const aspect = meta.find(a => a.name === name);
+      return aspect?.required ? 0 : aspect?.usage === "RECOMMENDED" ? 1 : 2;
+    };
+    return names.filter(k => !k.startsWith("---")).sort((a,b) => rank(a) - rank(b))
+      .map(k => [k, values[k] ?? ""] as const);
+  }, [listing?.item_specifics, group.ebayPreparation]);
+  const missingRequired = specifics.filter(([k,v]) => !v.trim() &&
+    group.ebayPreparation?.aspects.find(a => a.name === k)?.required).map(([k]) => k);
+  const missingRecommended = specifics.filter(([k,v]) => !v.trim() &&
+    group.ebayPreparation?.aspects.find(a => a.name === k)?.usage === "RECOMMENDED" &&
+    !missingRequired.includes(k)).map(([k]) => k);
 
   const titleLen = listing?.title?.length ?? 0;
 
@@ -606,9 +620,15 @@ export function ListingCard({
 
           <details className="specifics-details" open={Boolean(group.ebayPreparation)}>
             <summary>{specifics.length} item specifics</summary>
+            {(missingRequired.length > 0 || missingRecommended.length > 0) && (
+              <p className="specifics-missing-summary">
+                {missingRequired.length > 0 && <span className="missing-required">Required, still empty: {missingRequired.join(", ")}. </span>}
+                {missingRecommended.length > 0 && <span className="missing-recommended">Recommended, still empty: {missingRecommended.join(", ")}. </span>}
+              </p>
+            )}
             <div className="specifics-editor">
               {specifics.map(([k, v]) => (
-                <div className="specifics-edit-row" key={k}>
+                <div className={`specifics-edit-row${missingRequired.includes(k) ? " specific-missing-required" : missingRecommended.includes(k) ? " specific-missing-recommended" : ""}`} key={k}>
                   <input
                     type="text"
                     defaultValue={k}
@@ -619,7 +639,8 @@ export function ListingCard({
                     type="text"
                     value={v}
                     aria-label={`${k} value`}
-                    placeholder={group.ebayPreparation?.aspects.find(a => a.name === k)?.required ? "Required" : "Value"}
+                    placeholder={group.ebayPreparation?.aspects.find(a => a.name === k)?.required ? "Required" : group.ebayPreparation?.aspects.find(a => a.name === k)?.usage === "RECOMMENDED" ? "Recommended" : "Value"}
+                    aria-invalid={missingRequired.includes(k) || undefined}
                     list={`specific-${group.id}-${encodeURIComponent(k)}`}
                     onChange={(e) => updateSpecific(k, e.target.value)}
                   />

@@ -1,14 +1,28 @@
-// Server-side allowlist for the user-selectable AI models.
-//
-// The per-step model selector lets the browser send a model id to the AI routes.
-// That value is untrusted: without validation, anyone past the access gate could
-// bill an arbitrary or premium model to the deployment owner's key. We accept
-// only the known Claude families and OpenAI GPT model ids this app supports and
-// intentionally EXCLUDE Anthropic's premium "fable" tier.
-// To offer a different set (e.g. a key that does have fable access), edit this
-// pattern.
-const ALLOWED_CLAUDE_MODEL_PATTERN = /^claude-(opus|sonnet|haiku)-/;
-const ALLOWED_OPENAI_MODEL_PATTERN = /^gpt-[a-z0-9][a-z0-9.-]*$/i;
+// Exact server-owned lists prevent browser requests from choosing arbitrary billed models.
+// Lists may be replaced with comma-separated provider-specific environment settings.
+const DEFAULT_CLAUDE_MODELS = [
+  "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5",
+  "claude-sonnet-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+  "claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-4-5",
+  "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+];
+const DEFAULT_OPENAI_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
+
+export function allowedProviderModels(provider: "anthropic" | "openai"): string[] {
+  const configured = provider === "openai"
+    ? process.env.OPENAI_ALLOWED_MODELS : process.env.ANTHROPIC_ALLOWED_MODELS;
+  const defaults = provider === "openai" ? DEFAULT_OPENAI_MODELS : DEFAULT_CLAUDE_MODELS;
+  // Explicit server defaults remain usable, including custom OpenAI deployments.
+  const trustedDefaults = provider === "openai"
+    ? [process.env.OPENAI_SORT_MODEL || "gpt-5.6-luna", process.env.OPENAI_ANALYSIS_MODEL || "gpt-5.6-terra",
+       process.env.OPENAI_ROUTER_MODEL, process.env.OPENAI_ASPECT_MODEL]
+    : ["claude-sonnet-5-5"];
+  const prefix = provider === "openai" ? "gpt-" : "claude-";
+  return [...new Set([...(configured === undefined ? defaults : configured.split(",")),
+    ...trustedDefaults].filter((id): id is string => typeof id === "string")
+    .map(id => id.trim()).filter(id => id.startsWith(prefix) && id.length <= 64))];
+}
+
 const MAX_MODEL_ID_LEN = 64;
 
 function isValidModelString(model: unknown): model is string {
@@ -17,10 +31,7 @@ function isValidModelString(model: unknown): model is string {
 
 /** True when `model` is a non-empty string this deployment is allowed to call. */
 export function isAllowedModel(model: unknown): model is string {
-  return (
-    isValidModelString(model) &&
-    (ALLOWED_CLAUDE_MODEL_PATTERN.test(model) || ALLOWED_OPENAI_MODEL_PATTERN.test(model))
-  );
+  return isAllowedProviderModel(model, "anthropic") || isAllowedProviderModel(model, "openai");
 }
 
 export function isAllowedProviderModel(
@@ -28,9 +39,7 @@ export function isAllowedProviderModel(
   provider: "anthropic" | "openai"
 ): model is string {
   if (!isValidModelString(model)) return false;
-  return provider === "openai"
-    ? ALLOWED_OPENAI_MODEL_PATTERN.test(model)
-    : ALLOWED_CLAUDE_MODEL_PATTERN.test(model);
+  return allowedProviderModels(provider).includes(model);
 }
 
 /**

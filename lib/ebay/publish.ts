@@ -1156,7 +1156,7 @@ export async function prepareListing(accessToken: string, raw: ListingResult, im
   if (!conditions.some(c => c.value === proposed)) issues.push("Choose a condition supported by this category.");
   const expiresAt = Date.now() + 23 * 60 * 60_000;
   return { listing: prepared, review: { categoryId: catId, expiresAt, signature: signReview(catId, expiresAt) },
-    preparation: { categories, conditions, aspects: meta.map(a => ({ name:a.name,required:a.required,values:a.values,mode:a.mode })), issues } };
+    preparation: { categories, conditions, aspects: meta.map(a => ({ name:a.name,required:a.required,usage:a.usage,values:a.values,mode:a.mode })), issues } };
 }
 
 export async function publishListing(accessToken: string, setup: AccountSetup, input: PublishInput,

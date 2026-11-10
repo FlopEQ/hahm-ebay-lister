@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 const { create, list, provider } = vi.hoisted(() => ({ create: vi.fn(), list: vi.fn(), provider: { value: "anthropic" } }));
@@ -23,7 +23,16 @@ function request(profile = "hard_goods", analysisModel?: string) {
 }
 beforeEach(() => { vi.resetModules(); create.mockReset(); list.mockReset(); provider.value = "anthropic"; });
 
+afterEach(() => vi.unstubAllEnvs());
+
 describe("balanced analysis route", () => {
+  it("never bills an unapproved browser-selected family member", async () => {
+    create.mockResolvedValue(message(listing));
+    const { POST } = await import("@/app/api/analyze/route");
+    expect((await POST(request("hard_goods", "claude-opus-unapproved"))).status).toBe(200);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].model).toBe("claude-sonnet-5-5");
+  });
   it("uses balanced settings for both automatic classification and actual listing generation", async () => {
     create.mockResolvedValueOnce(message({ profile: "hard_goods" })).mockResolvedValueOnce(message(listing));
     const { POST } = await import("@/app/api/analyze/route");
@@ -62,6 +71,23 @@ describe("balanced analysis route", () => {
 });
 
 describe("model catalog", () => {
+  it("filters the unavailable-catalog fallback through the server allowlist", async () => {
+    vi.stubEnv("ANTHROPIC_ALLOWED_MODELS", "claude-haiku-5-5");
+    list.mockImplementation(() => { throw new Error("offline"); });
+    const { GET } = await import("@/app/api/models/route");
+    const data = await (await GET()).json();
+    expect(data.sortModels.map((m: { id: string }) => m.id)).toEqual(["claude-sonnet-5-5", "claude-haiku-5-5"]);
+    expect(data.analysisModels.map((m: { id: string }) => m.id)).toEqual(["claude-sonnet-5-5"]);
+  });
+  it("shows only approved OpenAI models, including explicit deployment models", async () => {
+    provider.value = "openai";
+    vi.stubEnv("OPENAI_ALLOWED_MODELS", "gpt-custom-snapshot");
+    const { GET } = await import("@/app/api/models/route");
+    const data = await (await GET()).json();
+    expect(data.sortModels.map((m: { id: string }) => m.id)).not.toContain("gpt-5.6-sol");
+    expect(data.analysisModels.map((m: { id: string }) => m.id)).toContain("gpt-custom-snapshot");
+    expect(data.sortModels.filter((m: { isDefault: boolean }) => m.isDefault)).toHaveLength(1);
+  });
   it("keeps provider catalogs separate with exactly one default per task", async () => {
     provider.value = "openai";
     const { GET } = await import("@/app/api/models/route");

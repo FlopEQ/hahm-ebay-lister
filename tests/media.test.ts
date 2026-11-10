@@ -6,6 +6,31 @@ const location = "https://apim.ebay.com/commerce/media/v1_beta/image/abc-123";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Media API image upload", () => {
+  test("includes structured eBay reasons, redacts the token, and never retries POST", async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ errors: [{
+      errorId: 12345, message: "Short reason", longMessage: "Photo too small. private-token" }] }), { status: 400 }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(uploadMediaImage("private-token", "aGVsbG8=", "image/jpeg", "book.jpg"))
+      .rejects.toThrow("eBay error 12345: Photo too small. [redacted]");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  test("reports a recovery GET rejection with eBay's reason", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response("{}", { status: 201, headers: { location } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ errors: [{ errorId: 99, message: "Image expired" }] }), { status: 404 }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(uploadMediaImage("token", "aGVsbG8=", "image/jpeg", "book.jpg"))
+      .rejects.toThrow("eBay error 99: Image expired");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  test("bounds malformed or oversized error details", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ errors: [{ message: "x".repeat(2000) }] }), { status: 400 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ errors: [{ message: { private: "data" } }] }), { status: 500 }));
+    vi.stubGlobal("fetch", fetch);
+    const error = await uploadMediaImage("token", "aGVsbG8=", "image/jpeg", "book.jpg").catch(e => e);
+    expect(error.message.length).toBeLessThan(550);
+    await expect(uploadMediaImage("token", "aGVsbG8=", "image/jpeg", "book.jpg"))
+      .rejects.toThrow("HTTP 500");
+  });
   test("uploads one binary multipart image and returns the listing URL", async () => {
     const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ imageUrl: eps }), { status: 201 }));
     vi.stubGlobal("fetch", fetch);
