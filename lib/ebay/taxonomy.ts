@@ -20,7 +20,7 @@ import {
   EBAY_CATEGORY_TREE_ID,
   EBAY_TOKEN_URL,
   basicAuthHeader,
-  getEbayAppCreds,
+  getEbayCreds,
 } from "./config";
 
 export type AspectMode = "FREE_TEXT" | "SELECTION_ONLY";
@@ -61,7 +61,7 @@ export async function appToken(): Promise<string> {
   const now = Date.now();
   if (cachedToken && cachedToken.expiresAt > now + 60_000)
     return cachedToken.token;
-  const creds = getEbayAppCreds();
+  const creds = getEbayCreds();
   const resp = await boundedFetch(EBAY_TOKEN_URL, {
     method: "POST",
     headers: {
@@ -153,10 +153,11 @@ const aspectCache = new Map<string, { value: AspectMeta[]; expires: number }>();
 // Required + optional aspects for a leaf category, with eBay's allowed values.
 export async function categoryAspects(
   categoryId: string,
+  fresh = false,
 ): Promise<AspectMeta[]> {
   if (!categoryId) return [];
   const cached = aspectCache.get(categoryId);
-  if (cached && cached.expires > Date.now()) return cached.value;
+  if (!fresh && cached && cached.expires > Date.now()) return cached.value;
   try {
     const data = await taxGet(
       `get_item_aspects_for_category?category_id=${encodeURIComponent(categoryId)}`,
@@ -227,10 +228,11 @@ const condCache = new Map<string, { value: Set<number>; expires: number }>();
 export async function acceptedConditionIds(
   categoryId: string,
   userToken?: string,
+  fresh = false,
 ): Promise<Set<number>> {
   if (!categoryId) return new Set();
   const cached = condCache.get(categoryId);
-  if (cached && cached.expires > Date.now()) return cached.value;
+  if (!fresh && cached && cached.expires > Date.now()) return cached.value;
   try {
     const token = userToken || (await appToken());
     const url =

@@ -5,6 +5,7 @@ const projectRoot = dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  allowedDevOrigins: ["ebay.nerdlab.pro"],
   // Pin the workspace root to this project (a stray lockfile elsewhere on the
   // machine would otherwise confuse Next's root detection).
   outputFileTracingRoot: projectRoot,

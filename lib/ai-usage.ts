@@ -1,79 +1,32 @@
-import { AsyncLocalStorage } from "node:async_hooks";
-import type Anthropic from "@anthropic-ai/sdk";
-export interface AiUsage {
-  stage: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  ms: number;
-  ok: boolean;
-  estimatedUsd?: number;
-}
-const scope = new AsyncLocalStorage<AiUsage[]>();
-export async function collectUsage<T>(
-  fn: () => Promise<T>,
-): Promise<{ result: T; usage: AiUsage[] }> {
-  const usage: AiUsage[] = [];
-  return scope.run(usage, async () => ({ result: await fn(), usage }));
-}
-export function currentUsage(): AiUsage[] {
-  return scope.getStore() ?? [];
-}
-export async function measuredMessage(
-  stage: string,
-  client: Anthropic,
-  params: Anthropic.MessageCreateParamsNonStreaming,
-  options?: Parameters<Anthropic["messages"]["create"]>[1],
-): Promise<Anthropic.Message> {
-  const start = Date.now();
-  let row: AiUsage = {
-    stage,
-    model: params.model,
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    ms: 0,
-    ok: false,
+import type { AiUsageSummary } from "@/lib/types";
+
+export const emptyAiUsage = (): AiUsageSummary => ({ calls: 0, inputTokens: 0, outputTokens: 0,
+  cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCostUsd: 0, models: [], unreportedCalls: 0 });
+
+// Shared with the browser. Unknown pricing/usage must remain unknown when
+// merging it with known costs, rather than understating the batch estimate.
+export function mergeAiUsage(a?: AiUsageSummary, b?: AiUsageSummary): AiUsageSummary | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    calls: a.calls + b.calls,
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    estimatedCostUsd: a.estimatedCostUsd === null || b.estimatedCostUsd === null
+      ? null : a.estimatedCostUsd + b.estimatedCostUsd,
+    models: [...new Set([...a.models, ...b.models])],
+    unreportedCalls: a.unreportedCalls + b.unreportedCalls,
   };
-  try {
-    const r = await client.messages.create(params, options);
-    const u = r.usage ?? { input_tokens: 0, output_tokens: 0 };
-    row = {
-      ...row,
-      model: r.model || params.model,
-      input: u.input_tokens,
-      output: u.output_tokens,
-      cacheRead: u.cache_read_input_tokens ?? 0,
-      cacheWrite: u.cache_creation_input_tokens ?? 0,
-      ok: true,
-    };
-    // Estimates use standard global list rates; raw counts are authoritative.
-    const rates: Record<string, [number, number]> = {
-      "claude-sonnet-4-6": [3, 15],
-      "claude-opus-4-8": [5, 25],
-      "claude-opus-4-7": [5, 25],
-      "claude-opus-4-6": [5, 25],
-      "claude-haiku-4-5": [1, 5],
-    };
-    const rate = rates[params.model];
-    if (rate)
-      row.estimatedUsd =
-        (row.input * rate[0] +
-          row.output * rate[1] +
-          row.cacheRead * rate[0] * 0.1 +
-          row.cacheWrite * rate[0] * 1.25) /
-        1e6;
-    if (r.stop_reason === "max_tokens")
-      throw new Error(
-        "AI output was truncated. Retry with fewer requested fields.",
-      );
-    return r;
-  } finally {
-    row.ms = Date.now() - start;
-    scope.getStore()?.push(row);
-    console.info(JSON.stringify({ event: "ai_usage", ...row }));
-  }
+}
+
+export function normalizeAiUsage(raw: unknown): AiUsageSummary | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const u = raw as AiUsageSummary;
+  if (![u.calls, u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens, u.unreportedCalls]
+    .every(n => typeof n === "number" && Number.isFinite(n) && n >= 0) ||
+    !(u.estimatedCostUsd === null || (typeof u.estimatedCostUsd === "number" && Number.isFinite(u.estimatedCostUsd) && u.estimatedCostUsd >= 0)) ||
+    !Array.isArray(u.models) || u.models.length > 100 || u.models.some(m => typeof m !== "string" || m.length > 128)) return undefined;
+  return { ...u, models: [...new Set(u.models)] };
 }

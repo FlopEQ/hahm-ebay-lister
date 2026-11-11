@@ -2,37 +2,35 @@
   "name": "ebay-lister-web",
   "version": "1.0.0",
   "private": true,
-  "description": "Friendly web app that turns item photos into ready-to-post eBay listings using Claude.",
+  "description": "Friendly web app that turns item photos into ready-to-post eBay listings using AI.",
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3001",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 3001",
     "lint": "tsc --noEmit",
-    "test": "vitest run",
-    "test:browser": "playwright test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.124.0",
-    "@supabase/supabase-js": "^2.115.0",
-    "inngest": "^4.20.0",
-    "next": "^15.5.25",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "zod": "^4.5.4"
+    "@anthropic-ai/sdk": "^0.132.1",
+    "next": "15.5.27",
+    "openai": "^7.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sharp": "0.35.5"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
     "@types/node": "^22.13.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "fake-indexeddb": "^6.2.5",
-    "prettier": "^3.9.6",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "overrides": {
-    "postcss": "^8.5.10"
+    "postcss": "8.5.26",
+    "nanoid": "3.3.18",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
   }
 }

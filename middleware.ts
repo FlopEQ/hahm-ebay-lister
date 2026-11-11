@@ -20,7 +20,7 @@ export function middleware(request: NextRequest) {
     "style-src 'self' 'unsafe-inline'",
     // blob:/data: for in-browser photo resizing previews
     "img-src 'self' data: blob: https://i.ebayimg.com",
-    `connect-src 'self'${process.env.SUPABASE_URL ? " " + new URL(process.env.SUPABASE_URL).origin : ""}`,
+    "connect-src 'self'",
     "frame-src 'none'",
     "object-src 'none'",
     "base-uri 'self'",
@@ -30,6 +30,7 @@ export function middleware(request: NextRequest) {
   // the inline <script> tags it generates during SSR (hydration, RSC payload).
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("x-nonce", nonce);
+  requestHeaders.set("Content-Security-Policy", csp);
 
   const response = NextResponse.next({
     request: { headers: requestHeaders },

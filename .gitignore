@@ -22,12 +22,13 @@ next-env.d.ts
 # local preview tooling & test fixtures
 .claude/
 public/test-photos.json
+data/
 
 # vercel local project link
 .vercel
 .env*
+!.env.example
 
-/playwright-report/
-/test-results/
-
-/supabase/.temp/
+# machine-specific server files
+/caddy.exe
+/[Cc]addyfile

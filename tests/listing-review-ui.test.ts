@@ -1,0 +1,145 @@
+import React, { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import ts from "typescript";
+import * as categories from "@/lib/categories";
+import * as labelPrint from "@/lib/labelPrint";
+import * as photoSelection from "@/lib/photoSelection";
+import * as modelPreferences from "@/lib/model-preferences";
+import type { EbayPolicyOptions, ItemGroup } from "@/lib/types";
+
+// Next keeps JSX intact for its own compiler. Compile this component locally
+// so the server-render tests work without changing the app's JSX configuration.
+const source = readFileSync(path.join(process.cwd(), "app", "ListingCard.tsx"), "utf8");
+const compiled = ts.transpileModule(source, { compilerOptions: {
+  jsx: ts.JsxEmit.React, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
+} }).outputText;
+const modules: Record<string, unknown> = {
+  react: React, "@/lib/categories": categories,
+  "@/lib/labelPrint": labelPrint, "@/lib/photoSelection": photoSelection,
+  "@/lib/model-preferences": modelPreferences,
+};
+const componentModule = { exports: {} as typeof import("@/app/ListingCard") };
+new Function("require", "module", "exports", "React", compiled)(
+  (name: string) => {
+    if (!(name in modules)) throw new Error(`Unexpected component dependency: ${name}`);
+    return modules[name];
+  }, componentModule, componentModule.exports, React,
+);
+const { ListingCard } = componentModule.exports;
+
+function preparedGroup(): ItemGroup {
+  return {
+    id: "review-item", sku: "BIN-100", name: "Book", photoIds: [], status: "done", postStatus: "idle",
+    listing: {
+      title: "Reviewed book", description: "A book with a marked cover", category: "book",
+      category_id: "267", ebay_condition: "USED_GOOD", suggested_price: 12,
+      item_specifics: { Author: "", Brand: "Publisher" },
+    },
+    ebayPreparation: {
+      categories: [{ id: "267", name: "Books", path: "Books & Magazines > Books" }, { id: "280", name: "Magazines" }],
+      conditions: [{ value: "USED_GOOD", label: "Good" }, { value: "USED_ACCEPTABLE", label: "Acceptable" }],
+      aspects: [{ name: "Author", required: true, values: ["Ada", "Grace"], mode: "SELECTION_ONLY" }],
+      issues: ["Enter Author"],
+    },
+  };
+}
+
+function render(group = preparedGroup(), ebayPolicies: EbayPolicyOptions | null = null) {
+  const noop = () => {};
+  return renderToStaticMarkup(createElement(ListingCard, {
+    group, photoById: () => undefined, ebayConnected: true, ebayPolicies,
+    onEdit: noop, onRenameSku: noop, onRetry: noop, onReorderPhoto: noop,
+    onTogglePhotoHidden: noop, onMakeCoverPhoto: noop, onRotatePhoto: noop,
+    onSaveDraft: noop, onPost: noop,
+  }));
+}
+
+function element(html: string, tag: string, id: string): string {
+  const match = html.match(new RegExp(`<${tag}[^>]*id="${id}"[^>]*>[\\s\\S]*?<\\/${tag}>`));
+  expect(match, `Missing ${tag} ${id}`).not.toBeNull();
+  return match![0];
+}
+
+describe("prepared listing review", () => {
+  it("visibly preselects the three preferred policies while preserving per-listing overrides", () => {
+    const policies: EbayPolicyOptions = {
+      fulfillmentPolicies:[{id:"media",name:"Free - Media Mail"},{id:"other",name:"Paid Shipping"}],
+      paymentPolicies:[{id:"pay",name:"Managed Payments"}],
+      returnPolicies:[{id:"ret",name:"Default Return Policy"}],
+      defaults:{fulfillmentPolicyId:"media",paymentPolicyId:"pay",returnPolicyId:"ret"},
+    };
+    const group = preparedGroup();
+    let html = render(group,policies);
+    expect(html).toContain('<option value="media" selected="">Free - Media Mail</option>');
+    expect(html).toContain('<option value="pay" selected="">Managed Payments</option>');
+    expect(html).toContain('<option value="ret" selected="">Default Return Policy</option>');
+    group.listing!.fulfillment_policy_id = "other";
+    html = render(group,policies);
+    expect(html).toContain('<option value="other" selected="">Paid Shipping</option>');
+    expect(html).not.toContain('<option value="media" selected="">');
+  });
+  it("surfaces absent metadata fields and prioritizes missing specifics without changing condition", () => {
+    const group = preparedGroup();
+    group.listing!.item_specifics = { Brand: "Publisher" };
+    group.ebayPreparation!.aspects.push({ name: "Language", required: false,
+      usage: "RECOMMENDED", values: ["English"], mode: "FREE_TEXT" });
+    const html = render(group);
+    expect(html).toContain("Required, still empty: Author.");
+    expect(html).toContain("Recommended, still empty: Language.");
+    expect(html.indexOf('aria-label="Author value"')).toBeLessThan(html.indexOf('aria-label="Language value"'));
+    expect(html.indexOf('aria-label="Language value"')).toBeLessThan(html.indexOf('aria-label="Brand value"'));
+    expect(html).toMatch(/aria-label="Author value"[^>]*aria-invalid="true"/);
+    expect(group.listing!.item_specifics).toEqual({ Brand: "Publisher" });
+    expect(group.listing!.ebay_condition).toBe("USED_GOOD");
+    group.listing!.item_specifics = { Author: "Ada", Language: "English", Brand: "Publisher" };
+    expect(render(group)).not.toContain("still empty:");
+  });
+  it("shows the accumulated item AI cost", () => {
+    const group = preparedGroup();
+    group.analysisUsage = { calls: 2, inputTokens: 100, outputTokens: 20, cacheReadTokens: 0,
+      cacheWriteTokens: 0, estimatedCostUsd: 0.024, models: ["claude"], unreportedCalls: 0 };
+    expect(render(group)).toContain("Estimated item AI cost: $0.024");
+    group.analysisUsage.estimatedCostUsd = null;
+    expect(render(group)).toContain("Estimated item AI cost: Unavailable");
+  });
+  it("shows a blank required specific as an editable input with allowed suggestions", () => {
+    const html = render();
+    const author = html.match(/<input[^>]*aria-label="Author value"[^>]*>/)?.[0];
+    expect(author).toBeDefined();
+    expect(author).toContain('value=""');
+    expect(author).toContain('placeholder="Required"');
+    expect(author).not.toMatch(/\b(?:disabled|readonly)=/i);
+    const suggestions = element(html, "datalist", "specific-review-item-Author");
+    expect(suggestions).toContain('value="Ada"');
+    expect(suggestions).toContain('value="Grace"');
+    expect(html).toMatch(/<details[^>]*class="specifics-details"[^>]*open=""/);
+  });
+
+  it("offers the exact category-specific eBay conditions and selects the reviewed one", () => {
+    const condition = element(render(), "select", "cond-review-item");
+    expect(condition).toContain('<option value="USED_GOOD" selected="">Good</option>');
+    expect(condition).toContain('<option value="USED_ACCEPTABLE">Acceptable</option>');
+    expect(condition).not.toContain('value="EXCELLENT"');
+    expect(condition).not.toContain('value="NEW_WITH_TAGS"');
+  });
+
+  it("shows suggested category choices with the reviewed category selected", () => {
+    const category = element(render(), "select", "category-review-item");
+    expect(category).toContain('<option value="267" selected="">Books &amp; Magazines &gt; Books</option>');
+    expect(category).toContain('<option value="280">Magazines</option>');
+  });
+
+  it.each(["drafting", "posting"] as const)("disables the edit fieldset while %s", (postStatus) => {
+    const html = render({ ...preparedGroup(), postStatus });
+    expect(html).toMatch(/<fieldset[^>]*disabled=""/);
+  });
+
+  it("keeps the edit fieldset enabled while awaiting review", () => {
+    const fieldset = render().match(/<fieldset[^>]*>/)?.[0];
+    expect(fieldset).toBeDefined();
+    expect(fieldset).not.toContain("disabled");
+  });
+});

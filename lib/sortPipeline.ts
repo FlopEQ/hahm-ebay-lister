@@ -1,16 +1,27 @@
-import { measuredMessage } from "@/lib/ai-usage";
 import type Anthropic from "@anthropic-ai/sdk";
+import type OpenAI from "openai";
+import type { ChatCompletionContentPart } from "openai/resources/chat/completions";
 import { anthropicAuthError, parseModelJson } from "@/lib/anthropic";
+import { OPENAI_SORT_MODEL, openAIAuthError, openAIJson } from "@/lib/openai";
 import {
   buildSortPrompt,
   buildVerifyGroupPrompt,
   buildVerifyMergePrompt,
   slugifyFolderName,
 } from "@/lib/prompts";
-import { labeledContent, toImageBlock, type WireImage } from "@/lib/images";
+import {
+  labeledContent,
+  openAILabeledContent,
+  toImageBlock,
+  toOpenAIImagePart,
+  type WireImage,
+} from "@/lib/images";
+import type { AiProvider } from "@/lib/aiProvider";
+import { CLAUDE_SORT_MODEL } from "@/lib/claude-models";
+import { measuredMessage, AiOutputError, AiConfigurationError } from "@/lib/ai-meter";
 
-const GROUP_MODEL = "claude-sonnet-4-6";
-const CHECK_MODEL = "claude-sonnet-4-6";
+const GROUP_MODEL = CLAUDE_SORT_MODEL;
+const CHECK_MODEL = CLAUDE_SORT_MODEL;
 const BATCH_SIZE = 10;
 
 // Concurrency caps — keep parallel bursts gentle so we don't trip Anthropic's
@@ -59,83 +70,94 @@ function firstText(resp: Anthropic.Message): string {
   return block && block.type === "text" ? block.text.trim() : "";
 }
 
+type AiClient = Anthropic | OpenAI;
+type AiContent = Anthropic.ContentBlockParam[] | ChatCompletionContentPart[];
+
 // Run an async fn over items with a fixed concurrency cap, preserving order.
 async function mapLimit<T, R>(
   items: T[],
   limit: number,
-  fn: (item: T, index: number) => Promise<R>,
+  fn: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
-  const workers = Array.from(
-    { length: Math.min(limit, items.length) },
-    async () => {
-      while (cursor < items.length) {
-        const i = cursor++;
-        results[i] = await fn(items[i], i);
-      }
-    },
-  );
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  });
   await Promise.all(workers);
   return results;
 }
 
-// Call Claude and parse JSON, retrying transient/rate-limit errors with backoff.
+// Call the active AI provider and parse JSON, retrying transient/rate-limit
+// errors with backoff. The deadline bounds the whole attempt loop.
 // `deadline` (epoch ms) bounds the whole attempt loop: calls are skipped once
 // the budget is (nearly) spent, and each call's HTTP timeout never extends past
 // it. SDK-internal retries are disabled — this loop is the only retry layer, so
 // time spent is predictable.
-async function claudeJson<T>(
-  client: Anthropic,
+async function modelJson<T>(
+  client: AiClient,
+  provider: AiProvider,
   model: string,
-  content: Anthropic.ContentBlockParam[],
+  content: AiContent,
   maxTokens: number,
   label: string,
-  deadline: number,
+  deadline: number
 ): Promise<T | null> {
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     const remaining = deadline - Date.now();
     if (remaining < MIN_CALL_MS) {
       console.warn(`[sort] ${label}: time budget exhausted — skipping call`);
       return null;
     }
     try {
-      const resp = await measuredMessage(
-        "sort",
-        client,
-        {
+      if (provider === "openai") {
+        return await openAIJson<T>({
+          client: client as OpenAI,
           model,
-          max_tokens: maxTokens,
-          messages: [{ role: "user", content }],
-        },
-        { timeout: Math.min(PER_CALL_TIMEOUT_MS, remaining), maxRetries: 0 },
-      );
-      return parseModelJson<T>(firstText(resp));
+          content: content as ChatCompletionContentPart[],
+          maxTokens,
+          timeout: Math.min(PER_CALL_TIMEOUT_MS, remaining),
+          maxRetries: 0,
+        });
+      } else {
+        const resp = await measuredMessage("sort", client as Anthropic,
+          {
+            model,
+            max_tokens: maxTokens,
+            messages: [{ role: "user", content: content as Anthropic.ContentBlockParam[] }],
+          },
+          { timeout: Math.min(PER_CALL_TIMEOUT_MS, remaining), maxRetries: 0 }
+        );
+        return parseModelJson<T>(firstText(resp));
+      }
     } catch (e) {
+      if (e instanceof AiConfigurationError) throw e;
+      if (e instanceof AiOutputError) {
+        console.warn(`[sort] ${label}: ${e.message}`);
+        return null;
+      }
       const status =
         e && typeof e === "object" && "status" in e
           ? Number((e as { status?: number }).status)
           : undefined;
       // Account-level failures won't fix themselves on retry — surface them.
-      const fatal = anthropicAuthError(e);
+      const fatal = provider === "openai" ? openAIAuthError(e) : anthropicAuthError(e);
       if (fatal) throw fatal;
       const retryable = status === undefined || RETRYABLE_STATUS.has(status);
-      if (attempt < 3 && retryable) {
-        const wait =
-          Math.min(10000, 800 * 2 ** attempt) + Math.floor(Math.random() * 400);
+      if (attempt < 1 && retryable) {
+        const wait = Math.min(10000, 800 * 2 ** attempt) + Math.floor(Math.random() * 400);
         if (Date.now() + wait + MIN_CALL_MS >= deadline) {
           console.warn(`[sort] ${label}: no budget left for retry — giving up`);
           return null;
         }
-        console.warn(
-          `[sort] ${label}: ${status ?? "parse/conn"} error — retry ${attempt + 1} in ${wait}ms`,
-        );
+        console.warn(`[sort] ${label}: ${status ?? "parse/conn"} error — retry ${attempt + 1} in ${wait}ms`);
         await sleep(wait);
         continue;
       }
-      console.warn(
-        `[sort] ${label}: giving up (${status ?? (e as Error).message})`,
-      );
+      console.warn(`[sort] ${label}: giving up (${status ?? (e as Error).message})`);
       return null;
     }
   }
@@ -146,32 +168,24 @@ async function claudeJson<T>(
 // The merge step (step 3) reunites any item split across a batch boundary, so
 // batches don't need sequential context — letting us parallelize safely.
 async function groupPhotos(
-  client: Anthropic,
+  client: AiClient,
+  provider: AiProvider,
   images: WireImage[],
   model: string,
-  deadline: number,
+  deadline: number
 ): Promise<{ name: string; indices: number[] }[]> {
   const total = images.length;
-  const batches: {
-    offset: number;
-    batch: WireImage[];
-    labelStart: number;
-    labelEnd: number;
-  }[] = [];
-  for (let offset = 0; offset < total; offset += BATCH_SIZE - 2) {
+  const batches: { offset: number; batch: WireImage[]; labelStart: number; labelEnd: number }[] = [];
+  for (let offset = 0; offset < total; offset += BATCH_SIZE) {
     const batch = images.slice(offset, offset + BATCH_SIZE);
-    batches.push({
-      offset,
-      batch,
-      labelStart: offset + 1,
-      labelEnd: offset + batch.length,
-    });
+    batches.push({ offset, batch, labelStart: offset + 1, labelEnd: offset + batch.length });
   }
 
   const perBatch = await mapLimit(batches, GROUP_CONCURRENCY, async (b) => {
-    const content: Anthropic.ContentBlockParam[] = [
-      ...labeledContent(b.batch, b.labelStart),
-    ];
+    const content: AiContent =
+      provider === "openai"
+        ? [...openAILabeledContent(b.batch, b.labelStart, "low")]
+        : [...labeledContent(b.batch, b.labelStart)];
     const note =
       b.offset > 0
         ? ` (These are photos ${b.labelStart}–${b.labelEnd} of ${total} total. Group only the photos shown above.)`
@@ -180,31 +194,18 @@ async function groupPhotos(
       type: "text",
       text: buildSortPrompt(b.batch.length, b.labelStart, b.labelEnd, note),
     });
-    const data = await claudeJson<{
+    const data = await modelJson<{
       groups?: { folder_name?: string; photo_indices?: number[] }[];
-    }>(
-      client,
-      model,
-      content,
-      2000,
-      `group ${b.labelStart}-${b.labelEnd}`,
-      deadline,
-    );
+    }>(client, provider, model, content, 2000, `group ${b.labelStart}-${b.labelEnd}`, deadline);
 
     const out: { name: string; indices: number[] }[] = [];
     for (const g of data?.groups ?? []) {
       const indices: number[] = [];
       for (const idx of g.photo_indices ?? []) {
         const real = Number(idx) - 1;
-        if (
-          Number.isInteger(real) &&
-          real >= b.offset &&
-          real < b.offset + b.batch.length
-        )
-          indices.push(real);
+        if (Number.isInteger(real) && real >= 0 && real < total) indices.push(real);
       }
-      if (indices.length)
-        out.push({ name: slugifyFolderName(g.folder_name ?? "item"), indices });
+      if (indices.length) out.push({ name: slugifyFolderName(g.folder_name ?? "item"), indices });
     }
     // data === null means the call failed after exhausting retries (vs. a
     // successful call that simply returned no groups) — track it so we can tell a
@@ -214,7 +215,7 @@ async function groupPhotos(
 
   if (perBatch.length > 0 && perBatch.every((b) => b.failed)) {
     throw new SortUnavailableError(
-      "The photo-sorting service was unavailable or rate-limited — every request failed. Wait a minute and try again; reducing the number of photos won't help.",
+      "The photo-sorting service was unavailable or rate-limited — every request failed. Wait a minute and try again; reducing the number of photos won't help."
     );
   }
 
@@ -225,31 +226,31 @@ async function groupPhotos(
 // A verify that can't run (budget spent) keeps the group as sorted — a rougher
 // result beats a platform timeout that loses the whole sort.
 async function verifyGroups(
-  client: Anthropic,
+  client: AiClient,
+  provider: AiProvider,
   images: WireImage[],
   groups: { name: string; indices: number[] }[],
   model: string,
-  deadline: number,
-): Promise<{
-  groups: { name: string; indices: number[] }[];
-  orphans: number[];
-}> {
+  deadline: number
+): Promise<{ groups: { name: string; indices: number[] }[]; orphans: number[] }> {
   const orphans: number[] = [];
 
   const checks = await mapLimit(groups, VERIFY_CONCURRENCY, async (group) => {
     if (group.indices.length === 1) return group;
-    const content = labeledContent(
-      group.indices.map((i) => images[i]),
-      1,
+    const content: AiContent =
+      provider === "openai"
+        ? openAILabeledContent(group.indices.map((i) => images[i]), 1, "low")
+        : labeledContent(group.indices.map((i) => images[i]), 1);
+    content.push({ type: "text", text: buildVerifyGroupPrompt(group.indices.length) });
+    const result = await modelJson<{ valid?: boolean; keep_indices?: number[] }>(
+      client,
+      provider,
+      model,
+      content,
+      300,
+      `verify ${group.name}`,
+      deadline
     );
-    content.push({
-      type: "text",
-      text: buildVerifyGroupPrompt(group.indices.length),
-    });
-    const result = await claudeJson<{
-      valid?: boolean;
-      keep_indices?: number[];
-    }>(client, model, content, 300, `verify ${group.name}`, deadline);
 
     if (!result || result.valid !== false) return group;
     const keepRaw = result.keep_indices ?? [];
@@ -269,156 +270,82 @@ async function verifyGroups(
 // Step 3 — merge adjacent groups that are really one item split in two.
 // A pair that can't be checked (budget spent) simply stays unmerged.
 async function mergeSplitGroups(
-  client: Anthropic,
+  client: AiClient,
+  provider: AiProvider,
   images: WireImage[],
   groups: { name: string; indices: number[] }[],
   model: string,
-  deadline: number,
+  deadline: number
 ): Promise<{ name: string; indices: number[] }[]> {
   if (groups.length < 2) return groups;
 
   const pairs = groups.slice(0, -1);
-  const pairVotes = await mapLimit(
-    pairs,
-    MERGE_CONCURRENCY,
-    async (group, i) => {
-      const next = groups[i + 1];
-      if (group.indices.length + next.indices.length > 24) return false;
-      const aBlock = toImageBlock(images[group.indices[0]]);
-      const bBlock = toImageBlock(images[next.indices[0]]);
-      if (!aBlock || !bBlock) return false;
-      const content: Anthropic.ContentBlockParam[] = [
-        ...labeledContent(group.indices.map((i) => images[i])),
-        { type: "text", text: "--- Group B ---" },
-        ...labeledContent(next.indices.map((i) => images[i])),
-        {
-          type: "text",
-          text: buildVerifyMergePrompt(
-            group.indices.length,
-            next.indices.length,
-          ),
-        },
-      ];
-      const result = await claudeJson<{ merge?: boolean }>(
-        client,
-        model,
-        content,
-        100,
-        `merge ${i}`,
-        deadline,
-      );
-      return result?.merge === true;
-    },
-  );
+  const pairVotes = await mapLimit(pairs, MERGE_CONCURRENCY, async (group, i) => {
+    const next = groups[i + 1];
+    const content =
+      provider === "openai"
+        ? (() => {
+            const aBlock = toOpenAIImagePart(images[group.indices[0]], "low");
+            const bBlock = toOpenAIImagePart(images[next.indices[0]], "low");
+            if (!aBlock || !bBlock) return null;
+            return [
+              { type: "text" as const, text: "Photo 1:" },
+              aBlock,
+              { type: "text" as const, text: "--- Group B ---" },
+              { type: "text" as const, text: "Photo 2:" },
+              bBlock,
+              { type: "text" as const, text: buildVerifyMergePrompt(group.indices.length, next.indices.length) },
+            ] satisfies ChatCompletionContentPart[];
+          })()
+        : (() => {
+            const aBlock = toImageBlock(images[group.indices[0]]);
+            const bBlock = toImageBlock(images[next.indices[0]]);
+            if (!aBlock || !bBlock) return null;
+            return [
+              { type: "text" as const, text: "Photo 1:" },
+              aBlock,
+              { type: "text" as const, text: "--- Group B ---" },
+              { type: "text" as const, text: "Photo 2:" },
+              bBlock,
+              { type: "text" as const, text: buildVerifyMergePrompt(group.indices.length, next.indices.length) },
+            ] satisfies Anthropic.ContentBlockParam[];
+          })();
+    if (!content) return false;
+    const result = await modelJson<{ merge?: boolean }>(
+      client,
+      provider,
+      model,
+      content,
+      100,
+      `merge ${i}`,
+      deadline
+    );
+    return result?.merge === true;
+  });
 
   const merged: { name: string; indices: number[] }[] = [];
-  for (let i = 0; i < groups.length; i++) {
-    const group = { name: groups[i].name, indices: [...groups[i].indices] };
-    while (i < groups.length - 1 && pairVotes[i]) {
-      i++;
-      group.indices.push(...groups[i].indices);
+  let i = 0;
+  while (i < groups.length) {
+    if (i < groups.length - 1 && pairVotes[i]) {
+      merged.push({
+        name: groups[i].name,
+        indices: [...groups[i].indices, ...groups[i + 1].indices],
+      });
+      i += 2;
+    } else {
+      merged.push(groups[i]);
+      i += 1;
     }
-    merged.push(group);
   }
   return merged;
 }
 
-// A detail image rejected by an isolated verification may need the surrounding
-// items for comparison. Require an explicit visual explanation; uncertainty
-// stays unassigned rather than becoming a new listing or an automatic merge.
-async function recoverDetailPhotos(
-  client: Anthropic,
-  images: WireImage[],
-  groups: { name: string; indices: number[] }[],
-  model: string,
-  deadline: number,
-) {
-  const assigned = new Set(groups.flatMap((g) => g.indices));
-  const orphans = images
-    .map((_, i) => i)
-    .filter((i) => !assigned.has(i))
-    .slice(0, 6);
-  for (const index of orphans) {
-    const candidates = groups
-      .filter((g) => g.indices.length < 24)
-      .map((g) => ({
-        g,
-        distance: Math.min(...g.indices.map((i) => Math.abs(i - index))),
-      }))
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, 2);
-    if (!candidates.length) continue;
-    const content: Anthropic.ContentBlockParam[] = [
-      { type: "text", text: "UNASSIGNED DETAIL PHOTO:" },
-      ...labeledContent([images[index]]),
-    ];
-    candidates.forEach(({ g }, i) =>
-      content.push(
-        { type: "text", text: `Candidate group ${i + 1}:` },
-        ...labeledContent(g.indices.slice(0, 12).map((j) => images[j])),
-      ),
-    );
-    content.push({
-      type: "text",
-      text: 'Is the unassigned image a tag, close-up or tape-measure view of exactly one candidate item? Compare textile texture, seams, trim, shape, color and measurement placement with ALL candidate views. A cropped view need not show the full item, but matching color or adjacency alone is insufficient. Reject conflicting labels/construction or ambiguous identical items. Return {"group":0,"detailPhoto":false,"evidence":""} if uncertain. Otherwise return {"group":1-based candidate number,"detailPhoto":true,"evidence":"specific visible matching features"}. JSON only.',
-    });
-    const vote = await claudeJson<{
-      group?: number;
-      detailPhoto?: boolean;
-      evidence?: string;
-    }>(client, model, content, 250, "recover detail", deadline);
-    if (
-      vote?.detailPhoto === true &&
-      Number.isInteger(vote.group) &&
-      vote.group! > 0 &&
-      vote.group! <= candidates.length &&
-      typeof vote.evidence === "string" &&
-      vote.evidence.length >= 15
-    ) {
-      const g = candidates[vote.group! - 1].g;
-      g.indices.push(index);
-      g.indices.sort((a, b) => a - b);
-    }
-  }
-  return groups;
-}
-
-// Overlapping batch windows share the very same source photos. Rejoin those
-// identities before visual verification; never merge solely on color or adjacency.
-export function joinOverlappingGroups(
-  groups: { name: string; indices: number[] }[],
-): { name: string; indices: number[] }[] {
-  const out: { name: string; indices: number[] }[] = [];
-  for (const original of groups) {
-    let g = { ...original, indices: [...new Set(original.indices)] };
-    for (let i = 0; i < out.length;) {
-      if (out[i].indices.some((x) => g.indices.includes(x))) {
-        g = {
-          name: out[i].name,
-          indices: [...new Set([...out[i].indices, ...g.indices])].sort(
-            (a, b) => a - b,
-          ),
-        };
-        out.splice(i, 1);
-        i = 0;
-      } else i++;
-    }
-    out.push(g);
-  }
-  return out.sort((a, b) => a.indices[0] - b.indices[0]);
-}
-
-function uniqueNames(
-  groups: { name: string; indices: number[] }[],
-): SortGroup[] {
+function uniqueNames(groups: { name: string; indices: number[] }[]): SortGroup[] {
   const counts = new Map<string, number>();
   return groups.map((g) => {
     const n = (counts.get(g.name) ?? 0) + 1;
     counts.set(g.name, n);
-    return {
-      name: n === 1 ? g.name : `${g.name}-${n}`,
-      photoIndices: g.indices,
-    };
+    return { name: n === 1 ? g.name : `${g.name}-${n}`, photoIndices: g.indices };
   });
 }
 
@@ -427,79 +354,68 @@ function uniqueNames(
 // across the chunk boundary gets split). Same prompt as the in-request merge
 // step, exposed for the /api/merge-check route.
 export async function checkMergePair(
-  client: Anthropic,
+  client: AiClient,
   imageA: WireImage,
   imageB: WireImage,
   countA: number,
   countB: number,
   model?: string,
+  provider: AiProvider = "anthropic"
 ): Promise<boolean> {
-  const aBlock = toImageBlock(imageA);
-  const bBlock = toImageBlock(imageB);
-  if (!aBlock || !bBlock) return false;
-  const content: Anthropic.ContentBlockParam[] = [
-    { type: "text", text: "Photo 1:" },
-    aBlock,
-    { type: "text", text: "--- Group B ---" },
-    { type: "text", text: "Photo 2:" },
-    bBlock,
-    {
-      type: "text",
-      text: 'These are only two representative photos, not all group photos. Return {"merge":false} unless identifying marks prove this is the same physical item. Never infer sameness merely from similar appearance.',
-    },
-  ];
-  const result = await claudeJson<{ merge?: boolean }>(
+  const content =
+    provider === "openai"
+      ? (() => {
+          const aBlock = toOpenAIImagePart(imageA, "low");
+          const bBlock = toOpenAIImagePart(imageB, "low");
+          if (!aBlock || !bBlock) return null;
+          return [
+            { type: "text" as const, text: "Photo 1:" },
+            aBlock,
+            { type: "text" as const, text: "--- Group B ---" },
+            { type: "text" as const, text: "Photo 2:" },
+            bBlock,
+            { type: "text" as const, text: buildVerifyMergePrompt(countA, countB) },
+          ] satisfies ChatCompletionContentPart[];
+        })()
+      : (() => {
+          const aBlock = toImageBlock(imageA);
+          const bBlock = toImageBlock(imageB);
+          if (!aBlock || !bBlock) return null;
+          return [
+            { type: "text" as const, text: "Photo 1:" },
+            aBlock,
+            { type: "text" as const, text: "--- Group B ---" },
+            { type: "text" as const, text: "Photo 2:" },
+            bBlock,
+            { type: "text" as const, text: buildVerifyMergePrompt(countA, countB) },
+          ] satisfies Anthropic.ContentBlockParam[];
+        })();
+  if (!content) return false;
+  const result = await modelJson<{ merge?: boolean }>(
     client,
-    model ?? CHECK_MODEL,
+    provider,
+    model ?? (provider === "openai" ? OPENAI_SORT_MODEL : CHECK_MODEL),
     content,
     100,
     "merge chunk-boundary",
     // The merge-check route runs under a 30s maxDuration — budget within it.
-    Date.now() + 25_000,
+    Date.now() + 25_000
   );
   return result?.merge === true;
 }
 
 export async function sortPhotos(
-  client: Anthropic,
+  client: AiClient,
   images: WireImage[],
   model?: string,
   budgetMs: number = SORT_TIME_BUDGET_MS,
+  provider: AiProvider = "anthropic"
 ): Promise<SortResult> {
-  const m = model ?? GROUP_MODEL;
+  const m = model ?? (provider === "openai" ? OPENAI_SORT_MODEL : GROUP_MODEL);
   const deadline = Date.now() + budgetMs;
-  const grouped = await groupPhotos(client, images, m, deadline);
+  const grouped = await groupPhotos(client, provider, images, m, deadline);
   if (grouped.length === 0) return { groups: [], orphanIndices: [] };
-  const linked = joinOverlappingGroups(grouped);
-  const seen = new Set<number>();
-  for (const g of linked)
-    g.indices = g.indices.filter((i) => {
-      if (seen.has(i)) return false;
-      seen.add(i);
-      return true;
-    });
-  const verified = await verifyGroups(
-    client,
-    images,
-    linked.filter((g) => g.indices.length),
-    m,
-    deadline,
-  );
-  const merged = await mergeSplitGroups(
-    client,
-    images,
-    verified.groups,
-    m,
-    deadline,
-  );
-  const checked =
-    merged.length < verified.groups.length
-      ? await verifyGroups(client, images, merged, m, deadline)
-      : { groups: merged, orphans: [] };
-  await recoverDetailPhotos(client, images, checked.groups, m, deadline);
-  const assigned = new Set(checked.groups.flatMap((g) => g.indices));
-  return {
-    groups: uniqueNames(checked.groups),
-    orphanIndices: images.map((_, i) => i).filter((i) => !assigned.has(i)),
-  };
+  const verified = await verifyGroups(client, provider, images, grouped, m, deadline);
+  const merged = await mergeSplitGroups(client, provider, images, verified.groups, m, deadline);
+  return { groups: uniqueNames(merged), orphanIndices: verified.orphans };
 }

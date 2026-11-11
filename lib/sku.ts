@@ -25,8 +25,45 @@ export function nextSuffix(index: number): string {
 
 // Build the full item SKU for the Nth item in a bin. With no prefix, fall back
 // to a plain letter so items still have a stable, unique reference.
+export function addNumericString(value: string, amount: number): string {
+  const add = String(Math.max(0, Math.floor(amount)));
+  let i = value.length - 1;
+  let j = add.length - 1;
+  let carry = 0;
+  let out = "";
+
+  while (i >= 0 || j >= 0 || carry) {
+    const a = i >= 0 ? value.charCodeAt(i--) - 48 : 0;
+    const b = j >= 0 ? add.charCodeAt(j--) - 48 : 0;
+    const sum = a + b + carry;
+    out = String(sum % 10) + out;
+    carry = Math.floor(sum / 10);
+  }
+
+  return out;
+}
+
+export function nextNumericSku(value: string): string {
+  const clean = sanitizeSku(value);
+  return /^\d+$/.test(clean) ? addNumericString(clean, 1) : "";
+}
+
+export function numericSkuValue(value: string): string {
+  const clean = sanitizeSku(value);
+  return /^\d+$/.test(clean) ? clean : "";
+}
+
+export function maxNumericSku(a: string | null | undefined, b: string | null | undefined): string {
+  const left = a ? numericSkuValue(a) : "";
+  const right = b ? numericSkuValue(b) : "";
+  if (!left) return right;
+  if (!right) return left;
+  return BigInt(right) > BigInt(left) ? right : left;
+}
+
 export function buildSku(prefix: string, index: number): string {
   const clean = sanitizeSku(prefix);
+  if (/^\d+$/.test(clean)) return addNumericString(clean, index);
   const suffix = nextSuffix(index);
   return clean ? `${clean}-${suffix}` : suffix;
 }
@@ -43,14 +80,22 @@ export function suffixToIndex(suffix: string): number {
 // Given SKUs that already exist on eBay, find where lettering for this bin
 // should continue — so a second batch from bin K31 starts at the letter after
 // the last one used (K31-N…) instead of colliding with K31-A again.
-export function nextIndexFromSkus(
-  existingSkus: string[],
-  prefix: string,
-): number {
+export function nextIndexFromSkus(existingSkus: string[], prefix: string): number {
   const clean = sanitizeSku(prefix);
   if (!clean) return 0;
+  if (/^\d+$/.test(clean)) {
+    const start = BigInt(clean);
+    let max: bigint | null = null;
+    for (const sku of existingSkus) {
+      const current = sanitizeSku(String(sku || ""));
+      if (!/^\d+$/.test(current)) continue;
+      const value = BigInt(current);
+      if (value >= start && (max === null || value > max)) max = value;
+    }
+    return max === null ? 0 : Number(max - start + 1n);
+  }
   const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^${escaped}-([A-Za-z]+)(?:-[a-f0-9]{12})?$`, "i");
+  const re = new RegExp(`^${escaped}-([A-Za-z]+)$`, "i");
   let max = -1;
   for (const sku of existingSkus) {
     const m = re.exec(String(sku || "").trim());
