@@ -11,6 +11,7 @@ import { rotateImageData } from "@/lib/rotateImage";
 import { buildSku } from "@/lib/sku";
 import { chunkImagesForUpload, type PhotoUpload } from "@/lib/uploadBatches";
 import { cleanListingIdentifiers } from "@/lib/listingCleanup";
+import { withPolicyDefaults } from "@/lib/ebay/policy-defaults";
 import { EbayConnect } from "./EbayConnect";
 import { ModelSelector } from "./ModelSelector";
 import { ReviewBoard } from "./ReviewBoard";
@@ -744,9 +745,14 @@ export default function Home() {
       };
       patchGroup({postStatus:mode === "draft" ? "drafting" : "posting",postError:undefined});
       try {
+        // Capture the defaults shown on the card into this reviewed save attempt.
+        if (ebayPolicies) {
+          group = { ...group, listing: withPolicyDefaults(group.listing!, ebayPolicies) };
+          patchGroup({ listing: group.listing });
+        }
         if (groupsRef.current.some(g => g.id !== groupId && g.sku.toLowerCase() === group!.sku.toLowerCase()))
           throw new Error("Another item in this batch uses this SKU. Give each item a unique SKU.");
-        if (!group.ebayReview || group.ebayReview.categoryId !== group.listing.category_id || group.ebayReview.expiresAt <= Date.now()) {
+        if (!group.ebayReview || group.ebayReview.categoryId !== group.listing!.category_id || group.ebayReview.expiresAt <= Date.now()) {
           const ids = ebayPhotoIds(group,MAX_PUBLISH_PHOTOS);
           const evidenceIds = [...new Set([...ids.slice(0,2),...ids.slice(-2)])];
           const evidence = await Promise.all(evidenceIds.map(async id => {
@@ -812,7 +818,7 @@ export default function Home() {
           postError:(e as Error).message});
       } finally { sendingRef.current.delete(groupId); }
     },
-    [photoMap,activeBatchId,batchName,photos,binPrefix,batchCategory,step,orphanIds,skuStart,aiPost]
+    [photoMap,activeBatchId,batchName,photos,binPrefix,batchCategory,step,orphanIds,skuStart,aiPost,ebayPolicies]
   );
 
   const saveDraftGroup = useCallback(

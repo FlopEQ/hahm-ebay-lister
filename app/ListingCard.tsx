@@ -484,14 +484,14 @@ export function ListingCard({
                 <label>
                   Shipping policy
                   <select
-                    value={listing.fulfillment_policy_id ?? ""}
+                    value={listing.fulfillment_policy_id || ebayPolicies?.defaults.fulfillmentPolicyId || ""}
                     onChange={(e) =>
                       onEdit(group.id, {
                         fulfillment_policy_id: e.target.value || undefined,
                       })
                     }
                   >
-                    <option value="">Use account default</option>
+                    <option value="">Choose a policy</option>
                     {(ebayPolicies?.fulfillmentPolicies ?? []).map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
@@ -502,14 +502,14 @@ export function ListingCard({
                 <label>
                   Payment policy
                   <select
-                    value={listing.payment_policy_id ?? ""}
+                    value={listing.payment_policy_id || ebayPolicies?.defaults.paymentPolicyId || ""}
                     onChange={(e) =>
                       onEdit(group.id, {
                         payment_policy_id: e.target.value || undefined,
                       })
                     }
                   >
-                    <option value="">Use account default</option>
+                    <option value="">Choose a policy</option>
                     {(ebayPolicies?.paymentPolicies ?? []).map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
@@ -520,14 +520,14 @@ export function ListingCard({
                 <label>
                   Return policy
                   <select
-                    value={listing.return_policy_id ?? ""}
+                    value={listing.return_policy_id || ebayPolicies?.defaults.returnPolicyId || ""}
                     onChange={(e) =>
                       onEdit(group.id, {
                         return_policy_id: e.target.value || undefined,
                       })
                     }
                   >
-                    <option value="">Use account default</option>
+                    <option value="">Choose a policy</option>
                     {(ebayPolicies?.returnPolicies ?? []).map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}

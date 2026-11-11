@@ -126,3 +126,20 @@ This release includes Anthropic SDK 0.132.1, Next.js 15.5.27, sharp 0.35.5,
 source-map-js 1.2.2, and Vitest 4.1.11. The dependency audit reported zero known
 vulnerabilities on October 8, 2026.
 Those tests used mocked external services; they do not certify live seller-account configuration.
+
+## Automatic shipping, payment, and return policies
+
+The app automatically selects Free - Media Mail, Managed Payments, and Default
+Return Policy from the connected seller's policies. Each listing can override
+these selections. Explicit selections in saved listings stay unchanged.
+
+To change defaults for everyone using this server, set the corresponding
+EBAY_DEFAULT_FULFILLMENT_POLICY_NAME, EBAY_DEFAULT_PAYMENT_POLICY_NAME, and
+EBAY_DEFAULT_RETURN_POLICY_NAME in your environment file, then restart the app.
+Use exact names. Alternatively set the matching _ID variables (see .env.example);
+IDs take precedence over names. Missing or ambiguous configured defaults require
+manual selection rather than silently choosing a different policy. If only one
+policy exists and no override is configured, it is automatically selected.
+
+Changing defaults does not update offers already staged on eBay. Stage those
+items again after reviewing their selected policies if a change is intended.

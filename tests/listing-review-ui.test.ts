@@ -8,7 +8,7 @@ import * as categories from "@/lib/categories";
 import * as labelPrint from "@/lib/labelPrint";
 import * as photoSelection from "@/lib/photoSelection";
 import * as modelPreferences from "@/lib/model-preferences";
-import type { ItemGroup } from "@/lib/types";
+import type { EbayPolicyOptions, ItemGroup } from "@/lib/types";
 
 // Next keeps JSX intact for its own compiler. Compile this component locally
 // so the server-render tests work without changing the app's JSX configuration.
@@ -47,10 +47,10 @@ function preparedGroup(): ItemGroup {
   };
 }
 
-function render(group = preparedGroup()) {
+function render(group = preparedGroup(), ebayPolicies: EbayPolicyOptions | null = null) {
   const noop = () => {};
   return renderToStaticMarkup(createElement(ListingCard, {
-    group, photoById: () => undefined, ebayConnected: true, ebayPolicies: null,
+    group, photoById: () => undefined, ebayConnected: true, ebayPolicies,
     onEdit: noop, onRenameSku: noop, onRetry: noop, onReorderPhoto: noop,
     onTogglePhotoHidden: noop, onMakeCoverPhoto: noop, onRotatePhoto: noop,
     onSaveDraft: noop, onPost: noop,
@@ -64,6 +64,23 @@ function element(html: string, tag: string, id: string): string {
 }
 
 describe("prepared listing review", () => {
+  it("visibly preselects the three preferred policies while preserving per-listing overrides", () => {
+    const policies: EbayPolicyOptions = {
+      fulfillmentPolicies:[{id:"media",name:"Free - Media Mail"},{id:"other",name:"Paid Shipping"}],
+      paymentPolicies:[{id:"pay",name:"Managed Payments"}],
+      returnPolicies:[{id:"ret",name:"Default Return Policy"}],
+      defaults:{fulfillmentPolicyId:"media",paymentPolicyId:"pay",returnPolicyId:"ret"},
+    };
+    const group = preparedGroup();
+    let html = render(group,policies);
+    expect(html).toContain('<option value="media" selected="">Free - Media Mail</option>');
+    expect(html).toContain('<option value="pay" selected="">Managed Payments</option>');
+    expect(html).toContain('<option value="ret" selected="">Default Return Policy</option>');
+    group.listing!.fulfillment_policy_id = "other";
+    html = render(group,policies);
+    expect(html).toContain('<option value="other" selected="">Paid Shipping</option>');
+    expect(html).not.toContain('<option value="media" selected="">');
+  });
   it("surfaces absent metadata fields and prioritizes missing specifics without changing condition", () => {
     const group = preparedGroup();
     group.listing!.item_specifics = { Brand: "Publisher" };

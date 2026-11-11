@@ -1,3 +1,4 @@
+import { defaultPolicyId } from "./policy-defaults";
 import { uploadMediaImage } from "./media";
 import { MAX_EBAY_PHOTOS } from "../photoSelection";
 import { boundedFetch, withDeadline } from "@/lib/network";
@@ -824,18 +825,8 @@ export async function fetchAccountSetup(accessToken: string): Promise<AccountSet
 }
 
 async function fetchAccountSetupUncached(accessToken: string): Promise<AccountSetup> {
-  const mp = `marketplace_id=${EBAY_MARKETPLACE_ID}`;
-  const [ful, pay, ret] = await Promise.all([
-    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/fulfillment_policy?${mp}`),
-    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/payment_policy?${mp}`),
-    ebayRequest(accessToken, "GET", `${EBAY_ACC_BASE}/return_policy?${mp}`),
-  ]);
-  return {
-    fulfillmentPolicyId: pickFirstPolicy(ful, "fulfillmentPolicies", "fulfillmentPolicyId"),
-    paymentPolicyId: pickFirstPolicy(pay, "paymentPolicies", "paymentPolicyId"),
-    returnPolicyId: pickFirstPolicy(ret, "returnPolicies", "returnPolicyId"),
-    locationKey: await fetchOrCreateLocation(accessToken),
-  };
+  const policies = await fetchAccountPolicyOptions(accessToken);
+  return { ...policies.defaults, locationKey: await fetchOrCreateLocation(accessToken) };
 }
 
 export async function fetchAccountPolicyOptions(
@@ -855,9 +846,9 @@ export async function fetchAccountPolicyOptions(
     paymentPolicies,
     returnPolicies,
     defaults: {
-      fulfillmentPolicyId: fulfillmentPolicies[0]?.id || "",
-      paymentPolicyId: paymentPolicies[0]?.id || "",
-      returnPolicyId: returnPolicies[0]?.id || "",
+      fulfillmentPolicyId: defaultPolicyId(fulfillmentPolicies, "Free - Media Mail", process.env.EBAY_DEFAULT_FULFILLMENT_POLICY_ID, process.env.EBAY_DEFAULT_FULFILLMENT_POLICY_NAME),
+      paymentPolicyId: defaultPolicyId(paymentPolicies, "Managed Payments", process.env.EBAY_DEFAULT_PAYMENT_POLICY_ID, process.env.EBAY_DEFAULT_PAYMENT_POLICY_NAME),
+      returnPolicyId: defaultPolicyId(returnPolicies, "Default Return Policy", process.env.EBAY_DEFAULT_RETURN_POLICY_ID, process.env.EBAY_DEFAULT_RETURN_POLICY_NAME),
     },
   };
 }
